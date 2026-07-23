@@ -1,37 +1,8 @@
-import os
 import sys
 import argparse
 from pathlib import Path
 import treeswift as ts
 
-
-def get_output_dir() -> Path:
-    phlag_dir = os.environ.get("PHLAG_DIR")
-    if not phlag_dir:
-        current = Path(__file__).resolve().parent
-        for _ in range(3):
-            env_path = current / ".env"
-            if env_path.exists():
-                try:
-                    with open(env_path, "r") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("#") and "=" in line:
-                                key, val = line.split("=", 1)
-                                if key.strip() == "PHLAG_DIR":
-                                    phlag_dir = val.strip().strip("'").strip('"')
-                                    break
-                except Exception:
-                    pass
-            if phlag_dir:
-                break
-            current = current.parent
-
-    if phlag_dir:
-        return Path(phlag_dir)
-    else:
-        repo_root = Path(__file__).resolve().parent.parent
-        return repo_root / "data"
 
 def generate_mapping(tree_path: Path, node_label: str, output_path: Path):
     tree = ts.read_tree_newick(tree_path)
@@ -65,6 +36,7 @@ def generate_mapping(tree_path: Path, node_label: str, output_path: Path):
     all_leaves = set(nd.get_label() for nd in tree.traverse_leaves())
     po_leaves = all_leaves - p1_leaves - p2_leaves - p3_leaves
     
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         for leaf in sorted(p1_leaves):
             f.write(f"{leaf}\tP1\n")
@@ -80,6 +52,7 @@ def generate_mapping(tree_path: Path, node_label: str, output_path: Path):
     print(f"  P2: {len(p2_leaves)} leaves")
     print(f"  P3: {len(p3_leaves)} leaves")
     print(f"  Po: {len(po_leaves)} leaves")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -104,21 +77,22 @@ def main():
         dest="output",
         type=Path,
         default=None,
-        help="Output mapping TSV path (default: <tree_stem>_<node>_mapping.tsv)."
+        help="Output mapping TSV path (default: mapping/<tree_stem>_<node>_mapping.tsv)."
     )
     
     args = parser.parse_args()
     
+    repo_root = Path(__file__).resolve().parent.parent
+    mapping_dir = repo_root / "mapping"
+    mapping_dir.mkdir(parents=True, exist_ok=True)
+
     if args.output is None:
-        output_dir = get_output_dir()
-        (output_dir / "mapping").mkdir(parents=True, exist_ok=True)
-        args.output = output_dir / "mapping" / f"{args.input_tree.stem}_{args.internal_node}_mapping.tsv"
+        args.output = mapping_dir / f"{args.input_tree.stem}_{args.internal_node}_mapping.tsv"
     elif not args.output.is_absolute():
-        output_dir = get_output_dir()
-        (output_dir / "mapping").mkdir(parents=True, exist_ok=True)
-        args.output = output_dir / "mapping" / args.output.name
+        args.output = mapping_dir / args.output.name
         
     generate_mapping(args.input_tree, args.internal_node, args.output)
+
 
 if __name__ == "__main__":
     main()

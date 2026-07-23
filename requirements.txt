@@ -1,0 +1,5 @@
+tskit==0.6.4
+dendropy==5.0.10
+msprime==1.3.4
+treeswift==1.1.45
+daiquiri==3.2.5.1

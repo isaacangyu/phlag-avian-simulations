@@ -165,11 +165,18 @@ if __name__ == "__main__":
     base_headers = list(null_fasta.keys())
 
     # Verify header consistency
-    missing_headers = set(base_headers) - set(alt_fasta.keys())
-    if missing_headers:
-        sys.exit(
-            f"Error: Headers present in null FASTA but missing in alt FASTA: {missing_headers}"
-        )
+    message = []
+    null_missing_headers = set(base_headers) - set(alt_fasta.keys())
+    if null_missing_headers:
+        message.append(f"Headers present in null FASTA but missing in alt FASTA: {null_missing_headers}")
+
+    
+    alt_missing_headers = set(alt_fasta.keys()) - set(base_headers)
+    if alt_missing_headers:
+        message.append(f"Headers present in alt FASTA but missing in null FASTA: {alt_missing_headers}")
+
+    if message:
+        sys.exit("\n".join(message))
 
     output_dir = get_output_dir()
     (output_dir / "msa").mkdir(parents=True, exist_ok=True)
