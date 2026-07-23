@@ -1,0 +1,4 @@
+Tried 6Mbps and 500k bps
+Checked num generations in millions
+Still same output, hitting max events
+2026-07-16 21:46:12,527 [18656] DEBUG    msprime.ancestry: time=523123 ancestors=389282 ret=ExitReason.MAX_EVENTS
