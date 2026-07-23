@@ -57,20 +57,12 @@ def read_fasta(filepath: Path) -> dict[str, str]:
 def mix_sequences(
     null_seq: str, alt_seq: str, pattern: str
 ) -> str:
-    seq_len = len(null_seq)
-    pattern_len = len(pattern)
-    chunk_size = seq_len // pattern_len
-    
     pieces = []
-    for i, char in enumerate(pattern):
-        start = i * chunk_size
-        # For the last chunk, take all remaining characters to handle any remainder
-        end = seq_len if i == pattern_len - 1 else (i + 1) * chunk_size
-        
+    for char in pattern:
         if char == "n":
-            pieces.append(null_seq[start:end])
+            pieces.append(null_seq)
         elif char == "a":
-            pieces.append(alt_seq[start:end])
+            pieces.append(alt_seq)
         else:
             sys.exit(f"Error: Invalid character '{char}' in pattern. Only 'n' and 'a' (case-insensitive) are allowed.")
             
