@@ -31,8 +31,7 @@ def get_output_dir() -> Path:
     if phlag_dir:
         return Path(phlag_dir)
     else:
-        repo_root = Path(__file__).resolve().parent.parent
-        return repo_root / "data"
+        sys.exit("Error: PHLAG_DIR environment variable is not set and could not be found in .env file.")
 
 import tskit
 import msprime
@@ -45,45 +44,11 @@ import treeswift as ts
 daiquiri.setup(level="DEBUG")
 RS=110
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument(
-        "-i", "--input-ts", type=Path, required=True, help="Input tree sequence object."
-    )
-    parser.add_argument(
-        "-o",
-        "--output-fasta",
-        type=Path,
-        required=False,
-        help="Output FASTA alignment.",
-    )
-    parser.add_argument(
-        "-m",
-        "--mutation-rate",
-        type=float,
-        required=False,
-        default=1.9086e-08,
-        help="Mutation rate.",
-    )
-    args = parser.parse_args()
-
-    output_dir = get_output_dir()
-    (output_dir / "msa").mkdir(parents=True, exist_ok=True)
-
-    if args.output_fasta is None:
-        output_path = output_dir / "msa" / f"{args.input_ts.stem}.fa"
-    elif not args.output_fasta.is_absolute():
-        output_path = output_dir / "msa" / args.output_fasta.name
-    else:
-        output_path = args.output_fasta
-
+def simulate_ts_to_fasta(input_ts: Path, output_path: Path, mutation_rate: float = 1.9086e-08):
     np.random.seed(RS)
+    mrate = mutation_rate
 
-    mrate = args.mutation_rate  # 1.908590331970381e-08  # mean mutation rate
-
-    ts = tskit.load(args.input_ts)
+    ts = tskit.load(input_ts)
     seq_len = int(ts.sequence_length)
 
     rate_gamma_shape = np.random.lognormal(1.5, 1)
@@ -94,7 +59,7 @@ if __name__ == "__main__":
     )
     lastp = 0
     while lastp < seq_len:
-        rlen = np.random.geometric(1 / 1e4)  # mean local length is 1e4
+        rlen = np.random.geometric(1 / 1e4)
         curp = min(lastp + rlen + 1, seq_len)
         rate_l[lastp:curp] *= np.random.gamma(rate_gamma_shape, 1 / rate_gamma_shape)
         lastp = curp
@@ -108,9 +73,50 @@ if __name__ == "__main__":
     mts = msprime.sim_mutations(ts, rate=rate_map, model=model, random_seed=RS)
 
     dseq = np.random.choice(["A", "C", "G", "T"], seq_len, p=eq_freq)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         for seq, pi in zip(mts.alignments(), mts.samples()):
             pop = mts.populations()[mts.nodes()[pi].population].metadata["name"]
             f.write(f">{pop}\n")
             nseq_l = [dseq[ix] if c == "N" else c for ix, c in enumerate(seq)]
             f.write("".join(nseq_l) + "\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "input_ts", type=Path, nargs="+", help="Input tree sequence object(s)."
+    )
+    parser.add_argument(
+        "-o",
+        "--output-fasta",
+        type=Path,
+        required=False,
+        help="Output FASTA alignment (only applied if a single input_ts is provided).",
+    )
+    parser.add_argument(
+        "-m",
+        "--mutation-rate",
+        type=float,
+        required=False,
+        default=1.9086e-08,
+        help="Mutation rate.",
+    )
+    args = parser.parse_args()
+
+    output_dir = get_output_dir()
+    output_subdir = output_dir / "msa" / "simulated"
+    output_subdir.mkdir(parents=True, exist_ok=True)
+
+    for ts_path in args.input_ts:
+        if args.output_fasta is None or len(args.input_ts) > 1:
+            output_path = output_subdir / f"{ts_path.stem}.fa"
+        elif not args.output_fasta.is_absolute():
+            output_path = output_subdir / args.output_fasta.name
+        else:
+            output_path = args.output_fasta
+
+        simulate_ts_to_fasta(ts_path, output_path, args.mutation_rate)
+
