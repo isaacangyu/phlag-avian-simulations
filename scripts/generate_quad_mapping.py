@@ -82,8 +82,13 @@ def main():
     
     args = parser.parse_args()
     
-    repo_root = Path(__file__).resolve().parent.parent
-    mapping_dir = repo_root / "mapping"
+    try:
+        from concat_sequences import get_phlag_dir
+        phlag_dir = get_phlag_dir()
+    except Exception:
+        phlag_dir = Path(__file__).resolve().parent.parent
+
+    mapping_dir = phlag_dir / "mapping"
     mapping_dir.mkdir(parents=True, exist_ok=True)
 
     if args.output is None:

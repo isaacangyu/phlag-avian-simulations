@@ -106,8 +106,14 @@ def main():
             output_path = args.output_fasta
         else:
             stem = input_path.stem
-            if stem.startswith("default"):
+            if "neoaves" in stem.lower():
+                new_stem = stem
+            elif stem.startswith("default"):
                 new_stem = stem.replace("default", "default-neoaves", 1)
+            elif stem.startswith("null-"):
+                new_stem = stem.replace("null-", "null-neoaves-", 1)
+            elif stem.startswith("alt-"):
+                new_stem = stem.replace("alt-", "alt-neoaves-", 1)
             else:
                 new_stem = f"{stem}-neoaves"
             output_path = input_path.parent / f"{new_stem}{input_path.suffix}"

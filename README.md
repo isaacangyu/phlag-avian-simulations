@@ -1,15 +1,18 @@
 # Avian gene tree simulations used to test Phlag
 ## Scripts
 ### `concat_sequences.py`
-Concatenates FASTA sequences by mixing null and alt/anomalous sequence files based on a pattern string (e.g. `nanan`).
+Concatenates FASTA (or TS) sequences into a 6Mbp sequence (12 chunks of 500kb each).
 
 **Usage:**
 ```bash
-python scripts/concat_sequences.py -n <null.fa> -a <alt.fa> -p <pattern> [-o <output.fa>]
-```
-or using positional arguments:
-```bash
-python scripts/concat_sequences.py <null.fa> <alt.fa> <pattern>
+# 1. Explicit pattern (must equal 12 chunks total; e.g. 'aanannnnaann'):
+python scripts/concat_sequences.py <null> <alt> <pattern>
+
+# 2. Random insertion of n alternative chunks (filename gets _{n}a suffix):
+python scripts/concat_sequences.py <null> <alt> <n>
+
+# 3. Default: randomly insert 3 alternative chunks into 12 total (filename has no pattern suffix):
+python scripts/concat_sequences.py <null> <alt>
 ```
 
 ### `generate_mapping.py`
@@ -18,6 +21,17 @@ Generates a 4-taxon population mapping TSV file (`P1`, `P2`, `P3`, `Po`) for `ds
 **Usage:**
 ```bash
 python scripts/generate_mapping.py -t <species_tree.nwk> -n <internal_node> [-o <output_mapping.tsv>]
+```
+
+### `.extract_branch.py` (Hidden utility)
+Extracts branch names from simulation filenames and batch renames simulation files to standard format:
+`null/alt-(neoaves)-branch_change_(rate-time)-index.ext`
+
+**Usage:**
+```bash
+python scripts/.extract_branch.py <file_or_path>
+python scripts/.extract_branch.py -b <file_or_path>    # Print branch name only
+python scripts/.extract_branch.py -r /path/to/dir       # Batch rename files
 ```
 
 ## Output Directory Configuration (`.env`)

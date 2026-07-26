@@ -6,32 +6,51 @@ import collections
 from pathlib import Path
 
 
-def get_output_dir() -> Path:
-    phlag_dir = os.environ.get("PHLAG_DIR")
-    if not phlag_dir:
-        current = Path(__file__).resolve().parent
-        for _ in range(3):
-            env_path = current / ".env"
-            if env_path.exists():
-                try:
-                    with open(env_path, "r") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("#") and "=" in line:
-                                key, val = line.split("=", 1)
-                                if key.strip() == "PHLAG_DIR":
-                                    phlag_dir = val.strip().strip("'").strip('"')
-                                    break
-                except Exception:
-                    pass
-            if phlag_dir:
-                break
-            current = current.parent
+def load_env_vars() -> dict[str, str]:
+    env_vars = {}
+    current = Path(__file__).resolve().parent
+    for _ in range(3):
+        env_path = current / ".env"
+        if env_path.exists():
+            try:
+                with open(env_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, val = line.split("=", 1)
+                            env_vars[key.strip()] = val.strip().strip("'").strip('"')
+            except Exception:
+                pass
+            break
+        current = current.parent
+    return env_vars
 
-    if phlag_dir:
-        return Path(phlag_dir)
-    else:
-        sys.exit("Error: PHLAG_DIR environment variable is not set and could not be found in .env file.")
+
+def get_large_files_dir() -> Path:
+    val = os.environ.get("LARGE_FILES_DIR")
+    if not val:
+        env_vars = load_env_vars()
+        val = env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
+    if val:
+        return Path(val)
+    sys.exit("Error: LARGE_FILES_DIR environment variable is not set and could not be found in .env file.")
+
+
+def get_output_dir() -> Path:
+    return get_large_files_dir()
+
+
+def get_phlag_dir() -> Path:
+    val = os.environ.get("PHLAG_DIR")
+    if not val:
+        env_vars = load_env_vars()
+        val = env_vars.get("PHLAG_DIR")
+    if val and val != str(get_large_files_dir()):
+        return Path(val)
+    cand = Path("/home/iang/phlag")
+    if cand.exists():
+        return cand
+    return Path(__file__).resolve().parent.parent
 
 import tskit
 import msprime

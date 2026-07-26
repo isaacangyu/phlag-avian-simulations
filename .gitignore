@@ -1,3 +1,10 @@
-# Data
+# Data and Environment
 store
+store/
 .env
+mapping/*.tsv
+
+# Python / Build Artifacts
+__pycache__/
+*.egg-info/
+.agents/
