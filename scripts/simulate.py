@@ -238,7 +238,6 @@ def ensure_mapping(tree_path: Path, node_label: str, mapping_path: Path = None) 
 def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate: float = 1.9086e-08, skip_neoaves: bool = False) -> Path:
     """
     Checks if a sequence file is simulated as FASTA in msa/simulated/<base_name>.fa.
-    If filter_neoaves is enabled (!skip_neoaves), null FASTA files are saved directly as null-neoaves-index.fa (never null-index.fa).
     If only .ts exists (or path to .ts), simulates it to FASTA.
     """
     sim_dir = output_dir / "msa" / "simulated"
@@ -251,13 +250,9 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
         print(f"[2/4 Check Simulation] FASTA sequence file exists: {input_file}", file=sys.stderr)
         return input_file
     
-    # Target FASTA base name
-    if not skip_neoaves and base_name.startswith("null-") and "neoaves" not in base_name.lower():
-        target_base = base_name.replace("null-", "null-neoaves-", 1)
-    else:
-        target_base = base_name
 
-    target_fa = sim_dir / f"{target_base}.fa"
+
+    target_fa = sim_dir / f"{base_name}.fa"
     if target_fa.exists():
         print(f"[2/4 Check Simulation] Simulated FASTA already exists: {target_fa}", file=sys.stderr)
         return target_fa
@@ -265,32 +260,23 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
     # Look for tree sequence (.ts) file
     ts_path = input_file
     if not (ts_path.exists() and ts_path.is_file() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts"))):
-        candidate = output_dir / "ts" / f"{base_name}.ts"
-        if candidate.exists():
-            ts_path = candidate
-        elif input_file.with_suffix(".ts").exists():
-            ts_path = input_file.with_suffix(".ts")
-        elif (input_file.parent / f"{base_name}.ts").exists():
-            ts_path = input_file.parent / f"{base_name}.ts"
+        ts_candidates = [
+            output_dir / "ts" / f"{base_name}.ts",
+            REPO_ROOT / "store" / "ts" / f"{base_name}.ts",
+            input_file.with_suffix(".ts"),
+            input_file.parent / f"{base_name}.ts",
+        ]
+        for cand in ts_candidates:
+            if cand.exists():
+                ts_path = cand
+                break
 
     if ts_path.exists() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts")):
-        if not skip_neoaves and base_name.startswith("null-") and "neoaves" not in base_name.lower():
-            # Simulate directly to temporary file and filter directly to null-neoaves-index.fa (no null-index.fa created)
-            temp_fa = sim_dir / f"temp_{base_name}.fa"
-            print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
-            simulate_ts_to_fasta(ts_path, temp_fa, mutation_rate=mutation_rate)
-            fasta_data = read_fasta(temp_fa)
-            filtered_data = {h: seq for h, seq in fasta_data.items() if h not in OUTGROUP_TAXA}
-            write_fasta(filtered_data, target_fa)
-            if temp_fa.exists():
-                temp_fa.unlink()
-            return target_fa
-        else:
-            print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
-            simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
-            return target_fa
-    elif (input_file.parent / f"{target_base}.fa").exists():
-        return input_file.parent / f"{target_base}.fa"
+        print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
+        simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
+        return target_fa
+    elif (input_file.parent / f"{base_name}.fa").exists():
+        return input_file.parent / f"{base_name}.fa"
     else:
         sys.exit(f"Error: Neither FASTA nor tree sequence file exists for base name: '{base_name}' ({input_file})")
 
@@ -298,38 +284,27 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
 def ensure_neoaves_filtered(fasta_path: Path) -> Path:
     """
     Checks if a FASTA sequence file is filtered for Neoaves (outgroup taxa removed).
-    Filters it if not already filtered.
+    Filters it in-place (writing to the same FASTA file) if not already filtered.
     Note: Alt sequences do not require Neoaves filtering (already simulated on Neoaves tree).
-    Note: Null FASTA sequence files are named null-neoaves-index.fa.
     """
     base_name = get_base_name(fasta_path)
     
-    # Alt sequences do not need Neoaves filtering
+    # Alt sequences do not need Neoaves filtering (silent check)
     if base_name.startswith("alt") or "anomaly" in base_name.lower():
-        print(f"[3/4 Check Neoaves Filter] Alt sequence does not require Neoaves filtering: {fasta_path}", file=sys.stderr)
         return fasta_path
 
-    if "neoaves" in base_name.lower():
+    fasta_data = read_fasta(fasta_path)
+    has_outgroup = any(h in OUTGROUP_TAXA for h in fasta_data)
+
+    if not has_outgroup:
         print(f"[3/4 Check Neoaves Filter] FASTA is already Neoaves-filtered: {fasta_path}", file=sys.stderr)
         return fasta_path
-    
-    if base_name.startswith("null-"):
-        new_base = base_name.replace("null-", "null-neoaves-", 1)
-    else:
-        new_base = f"{base_name}-neoaves"
-    
-    ext = fasta_path.suffix if fasta_path.suffix in (".fa", ".fasta") else ".fa"
-    filtered_path = fasta_path.parent / f"{new_base}{ext}"
-    if filtered_path.exists():
-        print(f"[3/4 Check Neoaves Filter] Neoaves-filtered FASTA already exists: {filtered_path}", file=sys.stderr)
-        return filtered_path
-    
-    print(f"[3/4 Check Neoaves Filter] Filtering Neoaves species from {fasta_path} -> {filtered_path}...", file=sys.stderr)
-    fasta_data = read_fasta(fasta_path)
+
+    print(f"[3/4 Check Neoaves Filter] Filtering Neoaves species from {fasta_path}...", file=sys.stderr)
     filtered_data = {h: seq for h, seq in fasta_data.items() if h not in OUTGROUP_TAXA}
-    write_fasta(filtered_data, filtered_path)
+    write_fasta(filtered_data, fasta_path)
     print(f"[3/4 Check Neoaves Filter] Filter complete: retained {len(filtered_data)} / {len(fasta_data)} species.", file=sys.stderr)
-    return filtered_path
+    return fasta_path
 
 
 def main(argv=None):
@@ -368,8 +343,8 @@ def main(argv=None):
         "--node", "--internal-node",
         dest="internal_node",
         type=str,
-        default="Nyctibiidae",
-        help="Internal node label for mapping check (default: Nyctibiidae)."
+        default=None,
+        help="Internal node label for mapping check (extracted from filename if omitted)."
     )
     parser.add_argument(
         "-m", "--mapping",
@@ -389,10 +364,20 @@ def main(argv=None):
         help="Skip Neoaves outgroup filtering."
     )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
-
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
+
+    # Automatically rename any legacy .ts files in store/ts and output_dir/ts to standard format before simulation
+    from importlib.util import module_from_spec, spec_from_file_location
+    eb_path = SCRIPTS_DIR / ".extract_branch.py"
+    spec = spec_from_file_location("extract_branch", eb_path)
+    if spec and spec.loader:
+        mod = module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for ts_dir in (REPO_ROOT / "store" / "ts", output_dir / "ts"):
+            if ts_dir.exists():
+                mod.rename_all_files(ts_dir)
 
     if args.null:
         args.null = normalize_and_rename_file(args.null)
@@ -425,41 +410,68 @@ def main(argv=None):
             pattern_raw = pos[2].name
         except SystemExit:
             is_pattern_mode = False
+    elif len(pos) == 1 or (len(pos) == 2 and not pos[1].exists()):
+        # Single sequence file or single alt + pattern
+        single_file = pos[0]
+        p_type = get_file_type(single_file)
+        if p_type == "a":
+            is_pattern_mode = True
+            alt_path = single_file
+            if len(pos) == 2 and not pos[1].exists():
+                pattern_raw = pos[1].name
+            else:
+                pattern_raw = None
+        elif len(pos) == 2 and not pos[1].exists():
+            try:
+                parse_indexed_pattern(pos[1].name)
+                pattern_raw = pos[1].name
+                alt_path = single_file
+                is_pattern_mode = True
+            except SystemExit:
+                is_pattern_mode = False
 
-    target_files = []
+        if is_pattern_mode:
+            null_path = args.null
+            if null_path is None:
+                sys.exit("Error: Null sequence path (-n/--null) must be provided.")
 
-    if is_pattern_mode:
-        target_files = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
-    elif len(pos) >= 2:
-        target_files = pos
-    else:
-        parser.print_help()
-        sys.exit("\nError: Must specify at least 2 files, or specify (null, alt, pattern).")
+            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+        else:
+            target_files = [single_file]
+
+    target_files = [] if not ('target_files' in locals()) else target_files
+
+    if is_pattern_mode and not target_files:
+        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+    elif not is_pattern_mode and not target_files:
+        if len(pos) >= 2:
+            target_files = pos
+        elif len(pos) == 1:
+            target_files = [pos[0]]
+        else:
+            parser.print_help()
+            sys.exit("\nError: Must specify sequence file(s), or (alt, pattern), or (null, alt, pattern).")
 
     # 1. Check Mapping
     tree_path = args.input_tree
     if tree_path is None:
-        tree_cand1 = REPO_ROOT / "speciestree" / "main-neoaves-numgen.nwk"
-        tree_cand2 = REPO_ROOT / "speciestree" / "main-avian-numgen.nwk"
-        if tree_cand1.exists():
-            tree_path = tree_cand1
-        elif tree_cand2.exists():
-            tree_path = tree_cand2
-        else:
-            tree_path = tree_cand1
+        tree_path = REPO_ROOT / "speciestree" / "main-neoaves-numgen.nwk"
 
-    # Extract branch name from filename (preceded by '-' and succeeded by '_') if available
+    # Extract branch name from filename if available
     node_label = args.internal_node
-    # If default or not provided, try to extract from input files
-    candidates_to_check = target_files + pos
-    if is_pattern_mode:
-        candidates_to_check.extend([null_path, alt_path])
+    if not node_label:
+        candidates_to_check = target_files + pos
+        if is_pattern_mode:
+            candidates_to_check.extend([null_path, alt_path])
 
-    for cand_file in candidates_to_check:
-        extracted = extract_branch_name_from_filename(cand_file)
-        if extracted:
-            node_label = extracted
-            break
+        for cand_file in candidates_to_check:
+            extracted = extract_branch_name_from_filename(cand_file)
+            if extracted:
+                node_label = extracted
+                break
+
+    if not node_label:
+        sys.exit("Error: Internal node label could not be determined. Please specify --node.")
 
     ensure_mapping(tree_path, node_label, args.mapping)
 
@@ -477,7 +489,13 @@ def main(argv=None):
     print(f"\n[4/4 Concat Sequences] Concatenating {len(processed_files)} sequence files...", file=sys.stderr)
     
     # Build args for concat_main
-    concat_argv = [str(f) for f in processed_files]
+    if is_pattern_mode:
+        concat_argv = ["-n", str(null_path), "-a", str(alt_path)]
+        if pattern_raw:
+            concat_argv.extend(["-p", pattern_raw])
+    else:
+        concat_argv = [str(f) for f in processed_files]
+
     if args.output:
         concat_argv.extend(["-o", str(args.output)])
 

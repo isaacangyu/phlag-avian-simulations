@@ -6,8 +6,8 @@ and rename files into standard format:
 
 Rules:
   - sizes are always 500kb (omitted in standard format)
-  - null FASTA files are always 'null-neoaves-index.fa' (never 'null-index.fa')
-  - prefixes: 'default'/'default-neoaves' -> 'null'/'null-neoaves', 'anomaly_case' -> 'alt'
+  - null FASTA files are always 'null-index.fa'
+  - prefixes: 'default'/'default-neoaves' -> 'null', 'anomaly_case' -> 'alt'
   - changes: {admixture, recombination_increase, 10X_up, recombination_suppression, 10X_down, recombination_decrease}
   - 'increase'/'decrease' renamed to 'up'/'down' (e.g. recombination_increase -> recombination_up)
   - admixture has rate and time in filename
@@ -155,10 +155,10 @@ def generate_new_filename(path_or_str: str | Path) -> str:
 
     if meta["is_concat"]:
         new_name = raw
-        new_name = new_name.replace("default-500Kb", "null-neoaves")
-        new_name = new_name.replace("default-neoaves-500Kb", "null-neoaves")
-        new_name = new_name.replace("default-neoaves", "null-neoaves")
-        new_name = new_name.replace("default", "null-neoaves")
+        new_name = new_name.replace("default-500Kb", "null")
+        new_name = new_name.replace("default-neoaves-500Kb", "null")
+        new_name = new_name.replace("default-neoaves", "null")
+        new_name = new_name.replace("default", "null")
         new_name = new_name.replace("anomaly_case-", "alt-")
         new_name = new_name.replace("-500Kb", "")
         new_name = new_name.replace("-500kb", "")
@@ -172,13 +172,7 @@ def generate_new_filename(path_or_str: str | Path) -> str:
     idx_str = f"-{meta['index']}" if meta["index"] else ""
 
     if prefix == "null" or not meta["change"]:
-        # For FASTA sequences, null is always null-neoaves-index.fa
-        if ext in (".fa", ".fasta"):
-            return f"null-neoaves{idx_str}{ext}"
-        else:
-            # For tree sequences (.ts), null-index.ts
-            neoaves_str = "-neoaves" if meta["is_neoaves"] else ""
-            return f"null{neoaves_str}{idx_str}{ext}"
+        return f"null{idx_str}{ext}"
 
     neoaves_str = "-neoaves" if meta["is_neoaves"] else ""
     branch = meta["branch"]
@@ -210,17 +204,11 @@ def rename_all_files(target_dir: str | Path, dry_run: bool = False) -> list[tupl
         new_filename = generate_new_filename(old_path)
         new_path = old_path.parent / new_filename
         
-        # Avoid duplicate target conflicts when converting default-500Kb-1.fa and default-neoaves-500Kb-1.fa to null-neoaves-1.fa
         if old_path != new_path:
             print(f"Renaming: {old_path.name} -> {new_filename}", file=sys.stderr)
             if not dry_run:
                 if new_path.exists() and new_path != old_path:
-                    # Overwrite/remove obsolete file to avoid collision
-                    if "neoaves" not in old_path.name.lower() and "neoaves" in new_path.name:
-                        old_path.unlink()
-                        continue
-                    else:
-                        old_path.rename(new_path)
+                    old_path.unlink()
                 else:
                     old_path.rename(new_path)
             renamed.append((old_path, new_path))

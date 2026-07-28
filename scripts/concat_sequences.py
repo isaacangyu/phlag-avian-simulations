@@ -6,6 +6,9 @@ import argparse
 from typing import Union
 from pathlib import Path
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPTS_DIR.parent
+
 
 def load_env_vars() -> dict[str, str]:
     env_vars = {}
@@ -87,54 +90,23 @@ def get_base_name(path: str | Path | None) -> str:
 
 
 def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
-    if f.exists() and f.is_file():
-        if f.suffix == ".ts":
-            bname = get_base_name(f)
-            simulated_fa = output_dir / "msa" / "simulated" / f"{bname}.fa"
-            if not simulated_fa.exists():
-                print(f"Simulating sequences for {f} -> {simulated_fa}...", file=sys.stderr)
-                try:
-                    from simulate_sequences import simulate_ts_to_fasta
-                except ImportError:
-                    sys.path.insert(0, str(Path(__file__).resolve().parent))
-                    from simulate_sequences import simulate_ts_to_fasta
-                simulate_ts_to_fasta(f, simulated_fa)
-            return simulated_fa
-        return f
-
     bname = get_base_name(f)
 
-    # 1. Direct FASTA candidate matches
-    for candidate in [
-        f.with_suffix(".fa"),
+    # Standard candidate paths
+    fasta_candidates = [
+        f if f.suffix in (".fa", ".fasta") else f.with_suffix(".fa"),
         output_dir / "msa" / "simulated" / f"{bname}.fa",
         output_dir / "msa" / "concat" / f"{bname}.fa",
         output_dir / "msa" / "simulated" / f.name,
         output_dir / "msa" / "concat" / f.name,
         f.parent / f"{bname}.fa",
-    ]:
+    ]
+
+    for candidate in fasta_candidates:
         if candidate.exists() and candidate.is_file():
             return candidate
 
-    # 2. Tree sequence (.ts) candidate matches to simulate to FASTA
-    for ts_cand in [
-        f.with_suffix(".ts"),
-        output_dir / "ts" / f"{bname}.ts",
-        f.parent / f"{bname}.ts",
-    ]:
-        if ts_cand.exists() and ts_cand.is_file():
-            simulated_fa = output_dir / "msa" / "simulated" / f"{bname}.fa"
-            if not simulated_fa.exists():
-                print(f"Simulating sequences for {ts_cand} -> {simulated_fa}...", file=sys.stderr)
-                try:
-                    from simulate_sequences import simulate_ts_to_fasta
-                except ImportError:
-                    sys.path.insert(0, str(Path(__file__).resolve().parent))
-                    from simulate_sequences import simulate_ts_to_fasta
-                simulate_ts_to_fasta(ts_cand, simulated_fa)
-            return simulated_fa
-
-    sys.exit(f"Error: Sequence file does not exist for base name: '{bname}' ({f})")
+    sys.exit(f"Error: Sequence FASTA file does not exist for base name: '{bname}' ({f})")
 
 
 def mix_sequences(null_seq: str, alt_seq: str, pattern: str) -> str:
@@ -195,7 +167,7 @@ def strip_chunk_index(stem: str) -> str:
 
 
 def get_chunk_index(stem: str) -> str:
-    """Extracts numeric chunk index from base name (e.g., '5' from null-5, null-neoaves-5, or legacy default-500Kb-5)."""
+    """Extracts numeric chunk index from base name (e.g., '5' from null-5 or legacy default-500Kb-5)."""
     m = re.search(r"-(\d+)(?:-[^/]+)?$", stem)
     if not m:
         m = re.search(r"-(\d+)-", stem)
@@ -237,11 +209,12 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list
     Finds all existing numeric chunk indices for a base name across ts, simulated, concat, and local directories.
     Returns a sorted list of unique integer chunk indices.
     """
-    clean_base = strip_chunk_index(get_base_name(base_path))
+    clean_base = strip_chunk_index(get_base_name(base_path)).lower()
     found_indices = set()
 
     search_dirs = [
         output_dir / "ts",
+        REPO_ROOT / "store" / "ts",
         output_dir / "msa" / "simulated",
         output_dir / "msa" / "concat",
         Path(base_path).parent if Path(base_path).parent.exists() else Path("."),
@@ -253,9 +226,19 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list
             continue
         try:
             for p in sdir.iterdir():
-                p_bname = get_base_name(p)
-                if clean_base.lower() in p_bname.lower():
-                    m = re.search(r"-(\d+)$", p_bname)
+                p_bname = get_base_name(p).lower()
+                # If searching for null, match null- or default-
+                matches_base = False
+                if clean_base in ("null", "default") or clean_base.startswith("null") or clean_base.startswith("default"):
+                    matches_base = p_bname.startswith("null") or p_bname.startswith("default")
+                else:
+                    p_clean = strip_chunk_index(p_bname)
+                    matches_base = (clean_base in p_bname) or (clean_base in p_clean)
+
+                if matches_base:
+                    m = re.search(r"-(\d+)(?:-[^/]+)?$", p_bname)
+                    if not m:
+                        m = re.search(r"-(\d+)-", p_bname)
                     if m:
                         found_indices.add(int(m.group(1)))
         except Exception:
@@ -408,6 +391,13 @@ def main(argv=None):
 
         if len(pos) == 3:
             pattern_raw = pos[2].name
+    elif len(pos) == 1 or (args.alt and not args.null):
+        is_pair_mode = True
+        alt_path = args.alt if args.alt else pos[0]
+        pattern_raw = args.pattern if args.pattern else None
+        
+        if null_path is None:
+            sys.exit("Error: Null sequence path (-n/--null) must be provided.")
 
     if is_pair_mode:
         files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
