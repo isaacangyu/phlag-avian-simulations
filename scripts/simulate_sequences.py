@@ -26,18 +26,22 @@ def load_env_vars() -> dict[str, str]:
     return env_vars
 
 
-def get_large_files_dir() -> Path:
-    val = os.environ.get("LARGE_FILES_DIR")
+def get_large_dir() -> Path:
+    val = os.environ.get("LARGE_DIR") or os.environ.get("LARGE_FILES_DIR")
     if not val:
         env_vars = load_env_vars()
-        val = env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
+        val = env_vars.get("LARGE_DIR") or env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
     if val:
         return Path(val)
-    sys.exit("Error: LARGE_FILES_DIR environment variable is not set and could not be found in .env file.")
+    sys.exit("Error: LARGE_DIR environment variable is not set and could not be found in .env file.")
+
+
+def get_large_files_dir() -> Path:
+    return get_large_dir()
 
 
 def get_output_dir() -> Path:
-    return get_large_files_dir()
+    return get_large_dir() / "simulations"
 
 
 def get_phlag_dir() -> Path:
@@ -126,10 +130,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     output_dir = get_output_dir()
-    output_subdir = output_dir / "msa" / "simulated"
-    output_subdir.mkdir(parents=True, exist_ok=True)
+    from concat_sequences import get_experiment_folder_name
 
     for ts_path in args.input_ts:
+        exp_name = get_experiment_folder_name(ts_path)
+        output_subdir = output_dir / exp_name / "simulated"
+        output_subdir.mkdir(parents=True, exist_ok=True)
+
         if args.output_fasta is None or len(args.input_ts) > 1:
             output_path = output_subdir / f"{ts_path.stem}.fa"
         elif not args.output_fasta.is_absolute():

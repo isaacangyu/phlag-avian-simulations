@@ -30,31 +30,26 @@ def load_env_vars() -> dict[str, str]:
     return env_vars
 
 
-def get_large_files_dir() -> Path:
-    val = os.environ.get("LARGE_FILES_DIR")
+def get_large_dir() -> Path:
+    val = os.environ.get("LARGE_DIR") or os.environ.get("LARGE_FILES_DIR")
     if not val:
         env_vars = load_env_vars()
-        val = env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
+        val = env_vars.get("LARGE_DIR") or env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
     if val:
         return Path(val)
-    sys.exit("Error: LARGE_FILES_DIR environment variable is not set and could not be found in .env file.")
+    sys.exit("Error: LARGE_DIR environment variable is not set and could not be found in .env file.")
+
+
+def get_large_files_dir() -> Path:
+    return get_large_dir()
 
 
 def get_output_dir() -> Path:
-    return get_large_files_dir()
+    return get_large_files_dir() / "simulations"
 
 
 def get_phlag_dir() -> Path:
-    val = os.environ.get("PHLAG_DIR")
-    if not val:
-        env_vars = load_env_vars()
-        val = env_vars.get("PHLAG_DIR")
-    if val and val != str(get_large_files_dir()):
-        return Path(val)
-    cand = Path("/home/iang/phlag")
-    if cand.exists():
-        return cand
-    return Path(__file__).resolve().parent.parent
+    return get_large_files_dir() / "phlag"
 
 
 def read_fasta(filepath: Path) -> dict[str, str]:
@@ -89,18 +84,46 @@ def get_base_name(path: str | Path | None) -> str:
     return Path(path).stem
 
 
+def get_experiment_folder_name(path_or_stem: str | Path | None) -> str:
+    """
+    Extracts experiment folder name from path or stem, e.g.:
+      'alt-Nyctibiidae_10X_up-1.ts' -> 'Nyctibiidae_10X_up'
+      'null-1.ts'                  -> 'null'
+    """
+    if not path_or_stem:
+        return "default"
+    clean = strip_chunk_index(get_base_name(path_or_stem))
+    if clean.startswith("alt-"):
+        return clean[4:]
+    elif clean.startswith("null-"):
+        return "null"
+    elif clean in ("null", "alt", "default"):
+        return clean
+    return clean
+
+
 def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
     bname = get_base_name(f)
+    exp_name = get_experiment_folder_name(f)
 
     # Standard candidate paths
     fasta_candidates = [
         f if f.suffix in (".fa", ".fasta") else f.with_suffix(".fa"),
+        output_dir / exp_name / "simulated" / f"{bname}.fa",
+    ]
+    
+    chunk_idx = get_chunk_index(bname)
+    if chunk_idx:
+        fasta_candidates.insert(1, output_dir / exp_name / "simulated" / f"{chunk_idx}.fa")
+
+    fasta_candidates.extend([
+        output_dir / exp_name / "concat" / f"{bname}.fa",
+        output_dir / exp_name / f"{bname}.fa",
+        output_dir / "simulated" / f"{bname}.fa",
         output_dir / "msa" / "simulated" / f"{bname}.fa",
         output_dir / "msa" / "concat" / f"{bname}.fa",
-        output_dir / "msa" / "simulated" / f.name,
-        output_dir / "msa" / "concat" / f.name,
         f.parent / f"{bname}.fa",
-    ]
+    ])
 
     for candidate in fasta_candidates:
         if candidate.exists() and candidate.is_file():
@@ -154,8 +177,8 @@ def build_rle_pattern(file_types: list[str]) -> str:
 
 
 def get_file_type(f: Path) -> str:
-    s = get_base_name(f).lower()
-    if "anomaly" in s or "alt" in s or "anom" in s:
+    s = str(f).lower()
+    if "anomaly" in s or "alt" in s or "anom" in s or "admixture" in s or "recombination" in s or "10x" in s:
         return "a"
     return "n"
 
@@ -204,22 +227,36 @@ def construct_indexed_path(base_name: str | Path, idx_str: str) -> Path:
     return base_p.parent / f"{clean_bname}-{idx_str}"
 
 
-def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list[int]:
+def find_existing_chunk_indices(base_path: str | Path, output_dir: Path, design: str = None) -> list[int]:
     """
     Finds all existing numeric chunk indices for a base name across ts, simulated, concat, and local directories.
     Returns a sorted list of unique integer chunk indices.
     """
     clean_base = strip_chunk_index(get_base_name(base_path)).lower()
+    exp_name = get_experiment_folder_name(base_path)
     found_indices = set()
 
     search_dirs = [
+        output_dir / exp_name / "ts",
+        output_dir / exp_name / "simulated",
+        output_dir / exp_name / "concat",
+        output_dir / exp_name,
         output_dir / "ts",
-        REPO_ROOT / "store" / "ts",
+        REPO_ROOT / "store" / "simulations" / exp_name / "ts",
+        REPO_ROOT / "store" / "simulations" / exp_name / "simulated",
+        REPO_ROOT / "store" / "simulations" / exp_name / "concat",
+        REPO_ROOT / "store" / "simulations" / exp_name,
+        REPO_ROOT / "store" / "simulations" / "ts",
         output_dir / "msa" / "simulated",
         output_dir / "msa" / "concat",
         Path(base_path).parent if Path(base_path).parent.exists() else Path("."),
         Path("."),
     ]
+    
+    phlag_dir = get_phlag_dir()
+    if design:
+        search_dirs.append(phlag_dir / design / "ts")
+    search_dirs.append(phlag_dir / "ts")
 
     for sdir in search_dirs:
         if not sdir.exists() or not sdir.is_dir():
@@ -259,7 +296,8 @@ def parse_pattern_to_12_chunks(pattern_raw: str | None) -> tuple[list[tuple[str,
       - If pattern_raw is a pattern string: validated to ensure exactly 12 chunks total, suffix_label = pattern_raw
     """
     if pattern_raw is None or pattern_raw == "":
-        alt_positions = set(random.sample(range(12), 3))
+        start_idx = random.randint(0, 9)
+        alt_positions = set(range(start_idx, start_idx + 3))
         pattern_items = [("a" if i in alt_positions else "n", "") for i in range(12)]
         return pattern_items, ""
 
@@ -268,7 +306,8 @@ def parse_pattern_to_12_chunks(pattern_raw: str | None) -> tuple[list[tuple[str,
         n_alt = int(pattern_raw_str)
         if not (0 <= n_alt <= 12):
             sys.exit(f"Error: Number of alternative chunks must be between 0 and 12, got {n_alt}.")
-        alt_positions = set(random.sample(range(12), n_alt))
+        start_idx = random.randint(0, max(0, 12 - n_alt))
+        alt_positions = set(range(start_idx, start_idx + n_alt))
         pattern_items = [("a" if i in alt_positions else "n", "") for i in range(12)]
         return pattern_items, f"{n_alt}a"
 
@@ -283,15 +322,15 @@ def parse_pattern_to_12_chunks(pattern_raw: str | None) -> tuple[list[tuple[str,
 
 
 def expand_pattern_to_target_files(
-    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path
+    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path, design: str = None
 ) -> tuple[list[Path], str]:
     """
     Expands a pattern string into concrete target file paths for 12 chunks (6Mbp total).
     Returns (target_files, suffix_label).
     """
     pattern_items, suffix_label = parse_pattern_to_12_chunks(pattern_raw)
-    null_indices = find_existing_chunk_indices(null_path, output_dir)
-    alt_indices = find_existing_chunk_indices(alt_path, output_dir)
+    null_indices = find_existing_chunk_indices(null_path, output_dir, design=design)
+    alt_indices = find_existing_chunk_indices(alt_path, output_dir, design=design)
 
     null_ptr = 0
     alt_ptr = 0
@@ -356,6 +395,7 @@ def main(argv=None):
         "-p", "--pattern", type=str, help="Pattern string (e.g. 'aanannnnaann'), single count n (e.g. '3'), or omitted for default 3 alt chunks."
     )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
+    parser.add_argument("--design", type=str, default=None, help="High-level design name.")
 
     args = parser.parse_args(argv)
 
@@ -400,7 +440,7 @@ def main(argv=None):
             sys.exit("Error: Null sequence path (-n/--null) must be provided.")
 
     if is_pair_mode:
-        files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+        files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
         resolved_files = [resolve_fasta_file(f, output_dir) for f in files_to_concat]
         fastas = []
         for rf in resolved_files:
@@ -414,17 +454,20 @@ def main(argv=None):
             if missing or extra:
                 sys.exit(f"Error: Header mismatch in file #{idx} ({resolved_files[idx-1]}): missing={missing}, extra={extra}")
 
-        clean_null_base = strip_chunk_index(get_base_name(null_path))
-        clean_alt_base = strip_chunk_index(get_base_name(alt_path))
+        exp_folder_name = get_experiment_folder_name(alt_path if alt_path else null_path)
+        exp_dir = output_dir / exp_folder_name
+        concat_dir = exp_dir / "concat"
+        concat_dir.mkdir(parents=True, exist_ok=True)
+
+        file_types = [get_file_type(f) for f in files_to_concat]
+        pattern_str = build_indexed_pattern(files_to_concat)
+        pattern_txt_content = pattern_str if pattern_str else (suffix_label if suffix_label else "")
 
         if args.output is None:
-            if suffix_label:
-                out_name = f"{clean_null_base}_{clean_alt_base}_{suffix_label}.fa"
-            else:
-                out_name = f"{clean_null_base}_{clean_alt_base}.fa"
-            output_path = output_subdir / out_name
+            output_name = f"{pattern_txt_content}.fa" if pattern_txt_content else f"{exp_folder_name}.fa"
+            output_path = concat_dir / output_name
         elif not args.output.is_absolute():
-            output_path = output_subdir / args.output.name
+            output_path = concat_dir / args.output.name
         else:
             output_path = args.output
 
@@ -436,6 +479,7 @@ def main(argv=None):
                 f.write(f"{seq_concat}\n")
 
         print(f"Writing output FASTA: {output_path}", file=sys.stderr)
+
         print("Done.", file=sys.stderr)
 
     elif len(pos) == 12:
@@ -456,22 +500,19 @@ def main(argv=None):
             if missing or extra:
                 sys.exit(f"Error: Header mismatch in file #{idx} ({resolved_files[idx-1]}): missing={missing}, extra={extra}")
 
-        first_null = next((rf for rf, ft in zip(resolved_files, file_types) if ft == "n"), None)
         first_alt = next((rf for rf, ft in zip(resolved_files, file_types) if ft == "a"), None)
+        first_null = next((rf for rf, ft in zip(resolved_files, file_types) if ft == "n"), None)
 
-        clean_null_base = strip_chunk_index(get_base_name(first_null)) if first_null else None
-        clean_alt_base = strip_chunk_index(get_base_name(first_alt)) if first_alt else None
+        exp_folder_name = get_experiment_folder_name(first_alt if first_alt else first_null)
+        exp_dir = output_dir / exp_folder_name
+        concat_dir = exp_dir / "concat"
+        concat_dir.mkdir(parents=True, exist_ok=True)
 
         if args.output is None:
-            if clean_null_base and clean_alt_base:
-                out_name = f"{clean_null_base}_{clean_alt_base}_{pattern_str}.fa"
-            elif clean_null_base:
-                out_name = f"{clean_null_base}_{pattern_str}.fa"
-            else:
-                out_name = f"{clean_alt_base}_{pattern_str}.fa"
-            output_path = output_subdir / out_name
+            output_name = f"{pattern_str}.fa" if pattern_str else f"{exp_folder_name}.fa"
+            output_path = concat_dir / output_name
         elif not args.output.is_absolute():
-            output_path = output_subdir / args.output.name
+            output_path = concat_dir / args.output.name
         else:
             output_path = args.output
 
@@ -483,6 +524,7 @@ def main(argv=None):
                 f.write(f"{seq_concat}\n")
 
         print(f"Writing output FASTA: {output_path}", file=sys.stderr)
+
         print("Done.", file=sys.stderr)
 
     else:

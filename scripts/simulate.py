@@ -31,6 +31,8 @@ from concat_sequences import (
     expand_pattern_to_target_files,
     get_file_type,
     get_phlag_dir,
+    get_experiment_folder_name,
+    get_chunk_index,
     main as concat_main,
 )
 
@@ -140,18 +142,202 @@ def get_base_name(path: str | Path | None) -> str:
     return Path(path).stem
 
 
+KNOWN_CHANGES_MAP = {
+    "recombination_increase": "recombination_up",
+    "recombination_decrease": "recombination_down",
+    "recombination_suppression": "recombination_down",
+    "10x_up": "10X_up",
+    "10x_down": "10X_down",
+    "admixture": "admixture",
+}
+
+
+def parse_filename(path_or_str: str | Path) -> dict:
+    """
+    Parses simulation filename into structured metadata:
+      - prefix: 'null' or 'alt'
+      - is_neoaves: bool
+      - branch: str | None
+      - change: str | None ('recombination_up', '10X_up', 'admixture', etc.)
+      - rate: str | None
+      - time: str | None
+      - index: str | None
+      - ext: str
+      - is_concat: bool
+    """
+    filename = Path(path_or_str).name
+    ext = ""
+    for e in (".ts", ".fa", ".fasta", ".tsv"):
+        if filename.lower().endswith(e):
+            ext = e
+            filename = filename[:-len(e)]
+            break
+    if not ext:
+        ext = Path(path_or_str).suffix
+
+    is_neoaves = "neoaves" in filename.lower()
+    is_concat = filename.startswith("concat_") or ("_a" in filename and ("n" in filename or "a" in filename) and ("_n" in filename or "_a" in filename or filename.endswith("_na")))
+
+    prefix = "alt" if ("anomaly" in filename.lower() or filename.startswith("alt")) else "null"
+    index = ""
+    m_idx = re.search(r"-(\d+)$", filename)
+    if m_idx:
+        index = m_idx.group(1)
+
+    branch = None
+    change = None
+    rate = None
+    time = None
+
+    # Handle admixture: rate and time
+    m_adm = re.search(r"admixture[-_]([A-Za-z0-9_]+?)[-_](rate\d+|0\d+)[-_](time\d+|\d+)", filename)
+    if not m_adm:
+        m_adm = re.search(r"([A-Za-z0-9_]+?)[-_]admixture[-_](rate\d+|0\d+)[-_](time\d+|\d+)", filename)
+        if m_adm:
+            branch = m_adm.group(1)
+            change = "admixture"
+            rate = m_adm.group(2)
+            time = m_adm.group(3)
+    else:
+        change = "admixture"
+        branch = m_adm.group(1)
+        rate = m_adm.group(2)
+        time = m_adm.group(3)
+
+    if not change:
+        # Check 10X_up / 10X_down
+        m_10x = re.search(r"([A-Za-z0-9_]+?)[-_](10X_up|10X_down|10x_up|10x_down)", filename, re.IGNORECASE)
+        if m_10x:
+            branch = m_10x.group(1)
+            change = m_10x.group(2).replace("10x_", "10X_")
+        else:
+            m_10x_rev = re.search(r"(10X_up|10X_down|10x_up|10x_down)[-_]([A-Za-z0-9_]+)", filename, re.IGNORECASE)
+            if m_10x_rev:
+                change = m_10x_rev.group(1).replace("10x_", "10X_")
+                branch = m_10x_rev.group(2).split("-500K")[0].split("-500k")[0]
+
+    if not change:
+        # Check recombination_increase / recombination_suppression / recombination_decrease / recombination_up / recombination_down
+        m_rec = re.search(r"recombination_(increase|decrease|suppression|up|down)[-_]([A-Za-z0-9_]+)", filename, re.IGNORECASE)
+        if m_rec:
+            c_raw = f"recombination_{m_rec.group(1).lower()}"
+            change = KNOWN_CHANGES_MAP.get(c_raw, "recombination_up")
+            branch = m_rec.group(2).split("-500K")[0].split("-500k")[0]
+        else:
+            m_rec_rev = re.search(r"([A-Za-z0-9_]+)[-_]recombination_(increase|decrease|suppression|up|down)", filename, re.IGNORECASE)
+            if m_rec_rev:
+                branch = m_rec_rev.group(1)
+                c_raw = f"recombination_{m_rec_rev.group(2).lower()}"
+                change = KNOWN_CHANGES_MAP.get(c_raw, "recombination_up")
+
+    # Clean up branch name
+    if branch:
+        branch = re.sub(r"-500[Kk][Bb].*$", "", branch)
+        branch = re.sub(r"-\d+$", "", branch)
+        branch = branch.strip("-_")
+
+    # Format rate and time
+    if rate and not rate.startswith("rate"):
+        rate = f"rate{rate}"
+    if time and not time.startswith("time"):
+        time = f"time{time}"
+
+    return {
+        "raw_stem": filename,
+        "prefix": prefix,
+        "is_neoaves": is_neoaves,
+        "branch": branch,
+        "change": change,
+        "rate": rate,
+        "time": time,
+        "index": index,
+        "ext": ext,
+        "is_concat": is_concat,
+    }
+
+
+def extract_branch_name(path_or_str: str | Path) -> str | None:
+    """
+    Extracts the branch name from a simulation filename.
+    Returns branch name string (e.g. 'Nyctibiidae', 'N249', 'Strigiformes_N297') or None.
+    """
+    meta = parse_filename(path_or_str)
+    return meta["branch"]
+
+
+def generate_new_filename(path_or_str: str | Path) -> str:
+    """
+    Converts filename to new standard format:
+        null/alt-(neoaves)-branch_change_(rate-time)-index.ext
+    """
+    meta = parse_filename(path_or_str)
+    ext = meta["ext"]
+    raw = meta["raw_stem"]
+
+    if meta["is_concat"]:
+        new_name = raw
+        new_name = new_name.replace("default-500Kb", "null")
+        new_name = new_name.replace("default-neoaves-500Kb", "null")
+        new_name = new_name.replace("default-neoaves", "null")
+        new_name = new_name.replace("default", "null")
+        new_name = new_name.replace("anomaly_case-", "alt-")
+        new_name = new_name.replace("-500Kb", "")
+        new_name = new_name.replace("-500kb", "")
+        new_name = new_name.replace("recombination_increase", "recombination_up")
+        new_name = new_name.replace("recombination_decrease", "recombination_down")
+        new_name = new_name.replace("recombination_suppression", "recombination_down")
+        new_name = new_name.replace("rate090_time7099554", "rate090-time7099554")
+        return f"{new_name}{ext}"
+
+    prefix = meta["prefix"]
+    idx_str = f"-{meta['index']}" if meta["index"] else ""
+
+    if prefix == "null" or not meta["change"]:
+        return f"null{idx_str}{ext}"
+
+    neoaves_str = "-neoaves" if meta["is_neoaves"] else ""
+    branch = meta["branch"]
+    change = meta["change"]
+
+    if change == "admixture" and meta["rate"] and meta["time"]:
+        change_spec = f"admixture_{meta['rate']}-{meta['time']}"
+    else:
+        change_spec = change
+
+    return f"alt{neoaves_str}-{branch}_{change_spec}{idx_str}{ext}"
+
+
+def rename_all_files(target_dir: str | Path, dry_run: bool = False) -> list[tuple[Path, Path]]:
+    """Batch renames files in target_dir according to standard scheme."""
+    target_path = Path(target_dir)
+    if not target_path.exists():
+        return []
+
+    renamed = []
+    files = [p for p in target_path.rglob("*") if p.is_file() and not p.name.startswith(".")]
+
+    for old_path in sorted(files):
+        if old_path.name == "ape.fa":
+            continue
+        new_filename = generate_new_filename(old_path)
+        new_path = old_path.parent / new_filename
+        
+        if old_path != new_path:
+            if not dry_run:
+                if new_path.exists() and new_path != old_path:
+                    old_path.unlink()
+                else:
+                    old_path.rename(new_path)
+            renamed.append((old_path, new_path))
+
+    return renamed
+
+
 def extract_branch_name_from_filename(path: str | Path | None) -> str | None:
     """Extracts branch name from filename. For admixture / compound branches (e.g., Strigiformes_N297), extracts the left branch (e.g., Strigiformes)."""
     if not path:
         return None
-    from importlib.util import module_from_spec, spec_from_file_location
-    eb_path = SCRIPTS_DIR / ".extract_branch.py"
-    spec = spec_from_file_location("extract_branch", eb_path)
-    extracted = None
-    if spec and spec.loader:
-        mod = module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        extracted = mod.extract_branch_name(path)
+    extracted = extract_branch_name(path)
 
     if not extracted:
         clean_name = get_base_name(path)
@@ -175,15 +361,7 @@ def normalize_and_rename_file(file_path: str | Path | None) -> Path | None:
     if not file_path:
         return None
     p = Path(file_path)
-    from importlib.util import module_from_spec, spec_from_file_location
-    eb_path = SCRIPTS_DIR / ".extract_branch.py"
-    spec = spec_from_file_location("extract_branch", eb_path)
-    if not (spec and spec.loader):
-        return p
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    new_name = mod.generate_new_filename(p)
+    new_name = generate_new_filename(p)
     if new_name == p.name:
         return p
 
@@ -235,24 +413,25 @@ def ensure_mapping(tree_path: Path, node_label: str, mapping_path: Path = None) 
     return mapping_path
 
 
-def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate: float = 1.9086e-08, skip_neoaves: bool = False) -> Path:
+def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate: float = 1.9086e-08, skip_neoaves: bool = False, design: str = None) -> Path:
     """
-    Checks if a sequence file is simulated as FASTA in msa/simulated/<base_name>.fa.
+    Checks if a sequence file is simulated as FASTA in output_dir/<exp_name>/simulated/<base_name>.fa.
     If only .ts exists (or path to .ts), simulates it to FASTA.
     """
-    sim_dir = output_dir / "msa" / "simulated"
-    sim_dir.mkdir(parents=True, exist_ok=True)
-
     base_name = get_base_name(input_file)
+    exp_name = get_experiment_folder_name(input_file)
+    chunk_idx = get_chunk_index(base_name)
+    simulated_name = f"{chunk_idx}.fa" if chunk_idx else f"{base_name}.fa"
+
+    sim_dir = output_dir / exp_name / "simulated"
+    sim_dir.mkdir(parents=True, exist_ok=True)
 
     # If already a FASTA file that exists
     if input_file.exists() and input_file.is_file() and (input_file.suffix == ".fa" or str(input_file).endswith(".fa")):
         print(f"[2/4 Check Simulation] FASTA sequence file exists: {input_file}", file=sys.stderr)
         return input_file
-    
 
-
-    target_fa = sim_dir / f"{base_name}.fa"
+    target_fa = sim_dir / simulated_name
     if target_fa.exists():
         print(f"[2/4 Check Simulation] Simulated FASTA already exists: {target_fa}", file=sys.stderr)
         return target_fa
@@ -260,12 +439,22 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
     # Look for tree sequence (.ts) file
     ts_path = input_file
     if not (ts_path.exists() and ts_path.is_file() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts"))):
+        phlag_dir = get_phlag_dir()
         ts_candidates = [
+            output_dir / exp_name / "ts" / f"{base_name}.ts",
             output_dir / "ts" / f"{base_name}.ts",
-            REPO_ROOT / "store" / "ts" / f"{base_name}.ts",
+            REPO_ROOT / "store" / "simulations" / exp_name / "ts" / f"{base_name}.ts",
+            REPO_ROOT / "store" / "simulations" / "ts" / f"{base_name}.ts",
+            REPO_ROOT / "store" / "simulations" / exp_name / f"{base_name}.ts",
             input_file.with_suffix(".ts"),
             input_file.parent / f"{base_name}.ts",
         ]
+        
+        if design:
+            ts_candidates.insert(0, phlag_dir / design / "ts" / f"{base_name}.ts")
+        
+        ts_candidates.append(phlag_dir / "ts" / f"{base_name}.ts")
+        
         for cand in ts_candidates:
             if cand.exists():
                 ts_path = cand
@@ -275,6 +464,8 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
         print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
         simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
         return target_fa
+    elif (input_file.parent / simulated_name).exists():
+        return input_file.parent / simulated_name
     elif (input_file.parent / f"{base_name}.fa").exists():
         return input_file.parent / f"{base_name}.fa"
     else:
@@ -340,11 +531,17 @@ def main(argv=None):
         help="Species tree path for mapping check."
     )
     parser.add_argument(
-        "--node", "--internal-node",
+        "-b", "--branch", "--node", "--internal-node",
         dest="internal_node",
         type=str,
         default=None,
         help="Internal node label for mapping check (extracted from filename if omitted)."
+    )
+    parser.add_argument(
+        "--extract-branch", "--branch-only",
+        action="store_true",
+        dest="extract_branch_only",
+        help="Output extracted branch name for given sequence file(s) and exit."
     )
     parser.add_argument(
         "-m", "--mapping",
@@ -363,21 +560,38 @@ def main(argv=None):
         action="store_true",
         help="Skip Neoaves outgroup filtering."
     )
+    parser.add_argument(
+        "--design",
+        type=str,
+        default=None,
+        help="High-level design name (model parameters) under PHLAG_DIR to look for tree sequences."
+    )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
 
-    # Automatically rename any legacy .ts files in store/ts and output_dir/ts to standard format before simulation
-    from importlib.util import module_from_spec, spec_from_file_location
-    eb_path = SCRIPTS_DIR / ".extract_branch.py"
-    spec = spec_from_file_location("extract_branch", eb_path)
-    if spec and spec.loader:
-        mod = module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        for ts_dir in (REPO_ROOT / "store" / "ts", output_dir / "ts"):
+    if output_dir.exists():
+        ts_dirs = [p / "ts" for p in output_dir.iterdir() if p.is_dir()] + [output_dir / "ts"]
+        for ts_dir in ts_dirs:
             if ts_dir.exists():
-                mod.rename_all_files(ts_dir)
+                rename_all_files(ts_dir)
+
+    if args.extract_branch_only:
+        targets = []
+        if args.null:
+            targets.append(args.null)
+        if args.alt:
+            targets.append(args.alt)
+        targets.extend([Path(p) for p in args.positional_args if p])
+
+        if not targets:
+            sys.exit("Error: Must specify sequence file(s) or -n/-a to extract branch from.")
+
+        for target in targets:
+            bname = extract_branch_name_from_filename(target) or extract_branch_name(target)
+            print(f"{target}: {bname}")
+        sys.exit(0)
 
     if args.null:
         args.null = normalize_and_rename_file(args.null)
@@ -385,9 +599,16 @@ def main(argv=None):
         args.alt = normalize_and_rename_file(args.alt)
     pos = [normalize_and_rename_file(Path(p)) for p in args.positional_args if p]
 
+    if args.null and not args.alt and pos:
+        args.alt = pos[0]
+        pos = pos[1:]
+    elif args.alt and not args.null and pos:
+        args.null = pos[0]
+        pos = pos[1:]
+
     # Determine input files for simulation / filtering / concat
     is_pattern_mode = False
-    if args.null and args.alt and args.pattern:
+    if args.null and args.alt:
         is_pattern_mode = True
         null_path = args.null
         alt_path = args.alt
@@ -414,7 +635,7 @@ def main(argv=None):
         # Single sequence file or single alt + pattern
         single_file = pos[0]
         p_type = get_file_type(single_file)
-        if p_type == "a":
+        if p_type == "a" or ("admixture" in single_file.name or "recombination" in single_file.name or "10X" in single_file.name or "10x" in single_file.name or single_file.name.startswith("N")):
             is_pattern_mode = True
             alt_path = single_file
             if len(pos) == 2 and not pos[1].exists():
@@ -431,18 +652,16 @@ def main(argv=None):
                 is_pattern_mode = False
 
         if is_pattern_mode:
-            null_path = args.null
-            if null_path is None:
-                sys.exit("Error: Null sequence path (-n/--null) must be provided.")
+            null_path = args.null if args.null else Path("null")
 
-            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
         else:
             target_files = [single_file]
 
     target_files = [] if not ('target_files' in locals()) else target_files
 
     if is_pattern_mode and not target_files:
-        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
     elif not is_pattern_mode and not target_files:
         if len(pos) >= 2:
             target_files = pos
@@ -478,7 +697,7 @@ def main(argv=None):
     # 2. Check Sequence Simulation & 3. Check Neoaves Filter
     processed_files = []
     for tf in target_files:
-        sim_fa = ensure_sequence_simulated(tf, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves)
+        sim_fa = ensure_sequence_simulated(tf, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves, design=args.design)
         if not args.skip_neoaves:
             filtered_fa = ensure_neoaves_filtered(sim_fa)
             processed_files.append(filtered_fa)
@@ -498,6 +717,8 @@ def main(argv=None):
 
     if args.output:
         concat_argv.extend(["-o", str(args.output)])
+    if args.design:
+        concat_argv.extend(["--design", args.design])
 
     concat_main(concat_argv)
 
