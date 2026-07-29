@@ -13,7 +13,6 @@ import re
 import sys
 import argparse
 from pathlib import Path
-import treeswift as ts
 
 # Ensure parent directory of scripts is in sys.path
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -82,6 +81,7 @@ def write_fasta(sequences: dict, filepath: Path):
 
 
 def generate_mapping(tree_path: Path, node_label: str, output_path: Path):
+    import treeswift as ts
     tree = ts.read_tree_newick(tree_path)
     label_to_node = tree.label_to_node(selection="all")
     
@@ -236,6 +236,9 @@ def parse_filename(path_or_str: str | Path) -> dict:
         branch = re.sub(r"-\d+$", "", branch)
         branch = branch.strip("-_")
 
+    if change and not filename.startswith("null"):
+        prefix = "alt"
+
     # Format rate and time
     if rate and not rate.startswith("rate"):
         rate = f"rate{rate}"
@@ -361,12 +364,14 @@ def normalize_and_rename_file(file_path: str | Path | None) -> Path | None:
     if not file_path:
         return None
     p = Path(file_path)
+    if not p.exists():
+        return p
     new_name = generate_new_filename(p)
     if new_name == p.name:
         return p
 
     new_path = p.parent / new_name
-    if p.exists() and p != new_path:
+    if p != new_path:
         if new_path.exists():
             print(f"[Auto-Rename] Target standard file already exists: {new_path}, removing legacy {p.name}", file=sys.stderr)
             try:
@@ -382,24 +387,33 @@ def normalize_and_rename_file(file_path: str | Path | None) -> Path | None:
                 print(f"[Auto-Rename Warning] Could not rename {p} -> {new_path}: {e}", file=sys.stderr)
                 return p
             return new_path
-    return new_path
+    return p
 
 
-def ensure_mapping(tree_path: Path, node_label: str, mapping_path: Path = None) -> Path:
+def ensure_mapping(tree_path: Path, node_label: str, mapping_path: Path = None, exp_name: str = None, output_dir: Path = None) -> Path:
     """Checks if mapping file exists, otherwise generates it using species tree & internal node."""
-    target_name = f"{tree_path.stem}_{node_label}_mapping.tsv"
+    tree_stem = "neoaves"
+    target_name = f"{tree_stem}_{node_label}_mapping.tsv"
     
     if mapping_path is None:
+        if output_dir is None:
+            output_dir = get_output_dir()
         phlag_dir = get_phlag_dir()
-        phlag_mapping_path = phlag_dir / "mapping" / target_name
-        local_mapping_path = REPO_ROOT / "mapping" / target_name
         
-        if phlag_mapping_path.exists():
-            mapping_path = phlag_mapping_path
-        elif local_mapping_path.exists():
-            mapping_path = local_mapping_path
+        candidates = []
+        if exp_name:
+            candidates.append(output_dir / exp_name / target_name)
+            candidates.append(phlag_dir / "simulations" / exp_name / target_name)
         else:
-            mapping_dir = phlag_dir / "mapping"
+            candidates.append(output_dir / target_name)
+
+        for cand in candidates:
+            if cand.exists():
+                mapping_path = cand
+                break
+                
+        if mapping_path is None:
+            mapping_dir = output_dir / exp_name if exp_name else output_dir
             mapping_dir.mkdir(parents=True, exist_ok=True)
             mapping_path = mapping_dir / target_name
 
@@ -440,15 +454,19 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
     ts_path = input_file
     if not (ts_path.exists() and ts_path.is_file() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts"))):
         phlag_dir = get_phlag_dir()
-        ts_candidates = [
+        ts_candidates = []
+        if chunk_idx:
+            ts_candidates.extend([
+                output_dir / exp_name / "ts" / f"{chunk_idx}.ts",
+                output_dir / exp_name / f"{chunk_idx}.ts",
+            ])
+        ts_candidates.extend([
             output_dir / exp_name / "ts" / f"{base_name}.ts",
             output_dir / "ts" / f"{base_name}.ts",
-            REPO_ROOT / "store" / "simulations" / exp_name / "ts" / f"{base_name}.ts",
-            REPO_ROOT / "store" / "simulations" / "ts" / f"{base_name}.ts",
-            REPO_ROOT / "store" / "simulations" / exp_name / f"{base_name}.ts",
+            output_dir / exp_name / f"{base_name}.ts",
             input_file.with_suffix(".ts"),
             input_file.parent / f"{base_name}.ts",
-        ]
+        ])
         
         if design:
             ts_candidates.insert(0, phlag_dir / design / "ts" / f"{base_name}.ts")
@@ -570,12 +588,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
-
-    if output_dir.exists():
-        ts_dirs = [p / "ts" for p in output_dir.iterdir() if p.is_dir()] + [output_dir / "ts"]
-        for ts_dir in ts_dirs:
-            if ts_dir.exists():
-                rename_all_files(ts_dir)
+    
+    try:
+        from organize_simulations import organize_loose_ts_files
+        organize_loose_ts_files(output_dir)
+    except ImportError as e:
+        print(f"[Warning] Could not import organize_simulations: {e}", file=sys.stderr)
 
     if args.extract_branch_only:
         targets = []
@@ -692,7 +710,23 @@ def main(argv=None):
     if not node_label:
         sys.exit("Error: Internal node label could not be determined. Please specify --node.")
 
-    ensure_mapping(tree_path, node_label, args.mapping)
+    exp_names = set()
+    for tf in target_files:
+        exp_names.add(get_experiment_folder_name(tf))
+    if is_pattern_mode:
+        if alt_path:
+            exp_names.add(get_experiment_folder_name(alt_path))
+        if null_path:
+            exp_names.add(get_experiment_folder_name(null_path))
+
+    if "null" in exp_names and len(exp_names) > 1:
+        exp_names.remove("null")
+
+    if not exp_names:
+        exp_names.add("default")
+
+    for exp_name in sorted(exp_names):
+        ensure_mapping(tree_path, node_label, args.mapping, exp_name=exp_name, output_dir=output_dir)
 
     # 2. Check Sequence Simulation & 3. Check Neoaves Filter
     processed_files = []

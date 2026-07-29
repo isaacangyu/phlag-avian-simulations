@@ -30,26 +30,36 @@ def load_env_vars() -> dict[str, str]:
     return env_vars
 
 
-def get_large_dir() -> Path:
-    val = os.environ.get("LARGE_DIR") or os.environ.get("LARGE_FILES_DIR")
+def get_connection_dir() -> Path:
+    val = os.environ.get("CONNECTION_DIR")
     if not val:
         env_vars = load_env_vars()
-        val = env_vars.get("LARGE_DIR") or env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
+        val = env_vars.get("CONNECTION_DIR")
     if val:
-        return Path(val)
-    sys.exit("Error: LARGE_DIR environment variable is not set and could not be found in .env file.")
-
-
-def get_large_files_dir() -> Path:
-    return get_large_dir()
+        return Path(val).expanduser().resolve()
+    sys.exit("Error: CONNECTION_DIR environment variable is not set. Initialize a shared directory for simulations as input to phlag.")
 
 
 def get_output_dir() -> Path:
-    return get_large_files_dir() / "simulations"
+    return get_connection_dir() / "simulations"
 
 
 def get_phlag_dir() -> Path:
-    return get_large_files_dir() / "phlag"
+    val = os.environ.get("PHLAG_DIR")
+    if not val:
+        env_vars = load_env_vars()
+        val = env_vars.get("PHLAG_DIR")
+    if val:
+        p = Path(val).expanduser().resolve()
+        if p.exists():
+            return p
+    cand = (Path(__file__).resolve().parent.parent / "phlag").resolve()
+    if cand.exists():
+        return cand
+    cand_home = (Path.home() / "phlag").resolve()
+    if cand_home.exists():
+        return cand_home
+    sys.exit("Error: PHLAG_DIR environment variable is not set or phlag directory does not exist. Please clone the phlag repository.")
 
 
 def read_fasta(filepath: Path) -> dict[str, str]:
@@ -120,8 +130,6 @@ def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
         output_dir / exp_name / "concat" / f"{bname}.fa",
         output_dir / exp_name / f"{bname}.fa",
         output_dir / "simulated" / f"{bname}.fa",
-        output_dir / "msa" / "simulated" / f"{bname}.fa",
-        output_dir / "msa" / "concat" / f"{bname}.fa",
         f.parent / f"{bname}.fa",
     ])
 
@@ -242,13 +250,6 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path, design:
         output_dir / exp_name / "concat",
         output_dir / exp_name,
         output_dir / "ts",
-        REPO_ROOT / "store" / "simulations" / exp_name / "ts",
-        REPO_ROOT / "store" / "simulations" / exp_name / "simulated",
-        REPO_ROOT / "store" / "simulations" / exp_name / "concat",
-        REPO_ROOT / "store" / "simulations" / exp_name,
-        REPO_ROOT / "store" / "simulations" / "ts",
-        output_dir / "msa" / "simulated",
-        output_dir / "msa" / "concat",
         Path(base_path).parent if Path(base_path).parent.exists() else Path("."),
         Path("."),
     ]
@@ -266,18 +267,25 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path, design:
                 p_bname = get_base_name(p).lower()
                 # If searching for null, match null- or default-
                 matches_base = False
-                if clean_base in ("null", "default") or clean_base.startswith("null") or clean_base.startswith("default"):
+                if sdir.name in ("ts", "simulated", "concat") and sdir.parent.name.lower() == exp_name.lower():
+                    matches_base = True
+                elif sdir.name.lower() == exp_name.lower():
+                    matches_base = True
+                elif clean_base in ("null", "default") or clean_base.startswith("null") or clean_base.startswith("default"):
                     matches_base = p_bname.startswith("null") or p_bname.startswith("default")
                 else:
                     p_clean = strip_chunk_index(p_bname)
                     matches_base = (clean_base in p_bname) or (clean_base in p_clean)
 
                 if matches_base:
-                    m = re.search(r"-(\d+)(?:-[^/]+)?$", p_bname)
-                    if not m:
-                        m = re.search(r"-(\d+)-", p_bname)
-                    if m:
-                        found_indices.add(int(m.group(1)))
+                    if p_bname.isdigit():
+                        found_indices.add(int(p_bname))
+                    else:
+                        m = re.search(r"-(\d+)(?:-[^/]+)?$", p_bname)
+                        if not m:
+                            m = re.search(r"-(\d+)-", p_bname)
+                        if m:
+                            found_indices.add(int(m.group(1)))
         except Exception:
             pass
 
@@ -400,8 +408,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
-    output_subdir = output_dir / "msa" / "concat"
-    output_subdir.mkdir(parents=True, exist_ok=True)
 
     pos = [Path(p) for p in args.positional_args]
 

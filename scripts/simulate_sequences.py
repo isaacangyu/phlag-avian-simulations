@@ -26,22 +26,18 @@ def load_env_vars() -> dict[str, str]:
     return env_vars
 
 
-def get_large_dir() -> Path:
-    val = os.environ.get("LARGE_DIR") or os.environ.get("LARGE_FILES_DIR")
+def get_connection_dir() -> Path:
+    val = os.environ.get("CONNECTION_DIR")
     if not val:
         env_vars = load_env_vars()
-        val = env_vars.get("LARGE_DIR") or env_vars.get("LARGE_FILES_DIR") or env_vars.get("PHLAG_DIR") or os.environ.get("PHLAG_DIR")
+        val = env_vars.get("CONNECTION_DIR")
     if val:
-        return Path(val)
-    sys.exit("Error: LARGE_DIR environment variable is not set and could not be found in .env file.")
-
-
-def get_large_files_dir() -> Path:
-    return get_large_dir()
+        return Path(val).expanduser().resolve()
+    sys.exit("Error: CONNECTION_DIR environment variable is not set. Initialize a shared directory for simulations as input to phlag.")
 
 
 def get_output_dir() -> Path:
-    return get_large_dir() / "simulations"
+    return get_connection_dir() / "simulations"
 
 
 def get_phlag_dir() -> Path:
@@ -49,12 +45,17 @@ def get_phlag_dir() -> Path:
     if not val:
         env_vars = load_env_vars()
         val = env_vars.get("PHLAG_DIR")
-    if val and val != str(get_large_files_dir()):
-        return Path(val)
-    cand = Path("/home/iang/phlag")
+    if val:
+        p = Path(val).expanduser().resolve()
+        if p.exists():
+            return p
+    cand = (Path(__file__).resolve().parent.parent / "phlag").resolve()
     if cand.exists():
         return cand
-    return Path(__file__).resolve().parent.parent
+    cand_home = (Path.home() / "phlag").resolve()
+    if cand_home.exists():
+        return cand_home
+    sys.exit("Error: PHLAG_DIR environment variable is not set or phlag directory does not exist. Please clone the phlag repository.")
 
 import tskit
 import msprime
