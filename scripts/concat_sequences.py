@@ -98,11 +98,27 @@ def get_experiment_folder_name(path_or_stem: str | Path | None) -> str:
     """
     Extracts experiment folder name from path or stem, e.g.:
       'alt-Nyctibiidae_10X_up-1.ts' -> 'Nyctibiidae_10X_up'
+      'anomaly_case-recombination_increase-N36-500Kb-1.ts' -> 'N36_recombination_up'
       'null-1.ts'                  -> 'null'
     """
     if not path_or_stem:
         return "default"
-    clean = strip_chunk_index(get_base_name(path_or_stem))
+    
+    p = Path(path_or_stem)
+    if get_base_name(p).isdigit():
+        for part in reversed(p.parts[:-1]):
+            if part.lower() not in ("ts", "simulated", "concat", "simulations", "store", ".", ".."):
+                res = get_experiment_folder_name(part)
+                if res and res != "null":
+                    return res
+
+    try:
+        from simulate import generate_new_filename
+        std_name = generate_new_filename(path_or_stem)
+        clean = strip_chunk_index(get_base_name(std_name))
+    except Exception:
+        clean = strip_chunk_index(get_base_name(path_or_stem))
+
     if clean.startswith("alt-"):
         return clean[4:]
     elif clean.startswith("null-"):
@@ -235,7 +251,7 @@ def construct_indexed_path(base_name: str | Path, idx_str: str) -> Path:
     return base_p.parent / f"{clean_bname}-{idx_str}"
 
 
-def find_existing_chunk_indices(base_path: str | Path, output_dir: Path, design: str = None) -> list[int]:
+def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list[int]:
     """
     Finds all existing numeric chunk indices for a base name across ts, simulated, concat, and local directories.
     Returns a sorted list of unique integer chunk indices.
@@ -255,8 +271,6 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path, design:
     ]
     
     phlag_dir = get_phlag_dir()
-    if design:
-        search_dirs.append(phlag_dir / design / "ts")
     search_dirs.append(phlag_dir / "ts")
 
     for sdir in search_dirs:
@@ -330,15 +344,15 @@ def parse_pattern_to_12_chunks(pattern_raw: str | None) -> tuple[list[tuple[str,
 
 
 def expand_pattern_to_target_files(
-    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path, design: str = None
+    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path
 ) -> tuple[list[Path], str]:
     """
     Expands a pattern string into concrete target file paths for 12 chunks (6Mbp total).
     Returns (target_files, suffix_label).
     """
     pattern_items, suffix_label = parse_pattern_to_12_chunks(pattern_raw)
-    null_indices = find_existing_chunk_indices(null_path, output_dir, design=design)
-    alt_indices = find_existing_chunk_indices(alt_path, output_dir, design=design)
+    null_indices = find_existing_chunk_indices(null_path, output_dir)
+    alt_indices = find_existing_chunk_indices(alt_path, output_dir)
 
     null_ptr = 0
     alt_ptr = 0
@@ -403,7 +417,6 @@ def main(argv=None):
         "-p", "--pattern", type=str, help="Pattern string (e.g. 'aanannnnaann'), single count n (e.g. '3'), or omitted for default 3 alt chunks."
     )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
-    parser.add_argument("--design", type=str, default=None, help="High-level design name.")
 
     args = parser.parse_args(argv)
 
@@ -446,7 +459,7 @@ def main(argv=None):
             sys.exit("Error: Null sequence path (-n/--null) must be provided.")
 
     if is_pair_mode:
-        files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
+        files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
         resolved_files = [resolve_fasta_file(f, output_dir) for f in files_to_concat]
         fastas = []
         for rf in resolved_files:

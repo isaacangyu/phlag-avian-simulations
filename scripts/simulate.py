@@ -86,27 +86,27 @@ def generate_mapping(tree_path: Path, node_label: str, output_path: Path):
     label_to_node = tree.label_to_node(selection="all")
     
     if node_label not in label_to_node:
-        sys.exit(f"Error: Internal node '{node_label}' not found in species tree '{tree_path}'.")
+        raise ValueError(f"Error: Internal node '{node_label}' not found in species tree '{tree_path}'.")
         
     nd_target = label_to_node[node_label]
     
-    # P2 = Leaves under target internal node
-    p2_leaves = set(nd.get_label() for nd in tree.extract_subtree(nd_target).traverse_leaves())
+    # Quadripartition around the branch ABOVE target internal node (edge between parent_node and nd_target):
+    # P1 & P2 = Leaves under children of target internal node
+    children = nd_target.child_nodes()
+    if len(children) < 2:
+        raise ValueError(f"Error: Internal node '{node_label}' has fewer than 2 children in species tree.")
+        
+    p1_leaves = set(nd.get_label() for nd in tree.extract_subtree(children[0]).traverse_leaves())
+    p2_leaves = set()
+    for child in children[1:]:
+        p2_leaves.update(nd.get_label() for nd in tree.extract_subtree(child).traverse_leaves())
     
-    # P1 = Leaves under sister clade(s) of target internal node
+    # P3 = Leaves under sister clade(s) of target internal node (attached to parent_node)
     parent_node = nd_target.get_parent()
-    p1_leaves = set()
+    p3_leaves = set()
     if parent_node:
         for child in parent_node.child_nodes():
             if child != nd_target:
-                p1_leaves.update(nd.get_label() for nd in tree.extract_subtree(child).traverse_leaves())
-                
-    # P3 = Leaves under sister clade(s) of parent node
-    p3_leaves = set()
-    grandparent_node = parent_node.get_parent() if parent_node else None
-    if grandparent_node:
-        for child in grandparent_node.child_nodes():
-            if child != parent_node:
                 p3_leaves.update(nd.get_label() for nd in tree.extract_subtree(child).traverse_leaves())
                 
     # Po = All remaining leaves in species tree
@@ -672,14 +672,14 @@ def main(argv=None):
         if is_pattern_mode:
             null_path = args.null if args.null else Path("null")
 
-            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
+            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
         else:
             target_files = [single_file]
 
     target_files = [] if not ('target_files' in locals()) else target_files
 
     if is_pattern_mode and not target_files:
-        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, design=args.design)
+        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
     elif not is_pattern_mode and not target_files:
         if len(pos) >= 2:
             target_files = pos
