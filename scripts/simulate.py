@@ -183,6 +183,7 @@ def parse_filename(path_or_str: str | Path) -> dict:
     m_idx = re.search(r"-(\d+)$", filename)
     if m_idx:
         index = m_idx.group(1)
+        filename = filename[:m_idx.start()]
 
     branch = None
     change = None
@@ -458,7 +459,18 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
         if chunk_idx:
             ts_candidates.extend([
                 output_dir / exp_name / "ts" / f"{chunk_idx}.ts",
+                output_dir / exp_name / "ts" / f"default-500Kb-{chunk_idx}.ts",
+                output_dir / exp_name / "ts" / f"default-{chunk_idx}.ts",
+                output_dir / exp_name / "ts" / f"null-{chunk_idx}.ts",
+                output_dir / exp_name / "ts" / f"favian-500Kb-{chunk_idx}.ts",
                 output_dir / exp_name / f"{chunk_idx}.ts",
+                output_dir / exp_name / f"default-500Kb-{chunk_idx}.ts",
+                output_dir / exp_name / f"default-{chunk_idx}.ts",
+                output_dir / exp_name / f"null-{chunk_idx}.ts",
+                output_dir / "null" / "ts" / f"default-500Kb-{chunk_idx}.ts",
+                output_dir / "null" / "ts" / f"default-{chunk_idx}.ts",
+                output_dir / "null" / "ts" / f"null-{chunk_idx}.ts",
+                output_dir / "null" / "ts" / f"{chunk_idx}.ts",
             ])
         ts_candidates.extend([
             output_dir / exp_name / "ts" / f"{base_name}.ts",
@@ -470,6 +482,9 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
         
         if design:
             ts_candidates.insert(0, phlag_dir / design / "ts" / f"{base_name}.ts")
+            if chunk_idx:
+                ts_candidates.insert(0, phlag_dir / design / "ts" / f"default-500Kb-{chunk_idx}.ts")
+                ts_candidates.insert(0, phlag_dir / design / "ts" / f"{chunk_idx}.ts")
         
         ts_candidates.append(phlag_dir / "ts" / f"{base_name}.ts")
         
@@ -479,6 +494,14 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
                 break
 
     if ts_path.exists() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts")):
+        if exp_name == "null" or ts_path.name.startswith("default"):
+            desired_name = f"null-{chunk_idx}.ts" if chunk_idx else "null.ts"
+            desired_path = ts_path.parent / desired_name
+            if ts_path != desired_path and not desired_path.exists():
+                print(f"[Simulate] Renaming null tree sequence {ts_path} -> {desired_path}", file=sys.stderr)
+                ts_path.rename(desired_path)
+                ts_path = desired_path
+
         print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
         simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
         return target_fa
@@ -539,7 +562,14 @@ def main(argv=None):
         help="Base name or path for alternative/anomalous sequence (without .ts or .fa).",
     )
     parser.add_argument(
-        "-p", "--pattern", type=str, help="Pattern string (e.g., 'a1n5a2a3n8n1' or 'n1a3a2n2')."
+        "-p", "--prop", "--proportion",
+        dest="proportion",
+        type=str,
+        default=None,
+        help="Proportion of alternative sequence (e.g. 0.25, 0.5, 3/12)."
+    )
+    parser.add_argument(
+        "--pattern", type=str, default=None, help="Alternative pattern string specifying alt chunk order (e.g. 'a2a1a3' or 'a1a2a3')."
     )
     parser.add_argument(
         "-t", "--tree", "--input-tree",
@@ -626,60 +656,64 @@ def main(argv=None):
 
     # Determine input files for simulation / filtering / concat
     is_pattern_mode = False
+    pattern_raw = args.pattern
+    proportion_raw = args.proportion
+
     if args.null and args.alt:
         is_pattern_mode = True
         null_path = args.null
         alt_path = args.alt
-        pattern_raw = args.pattern
     elif len(pos) == 3 and not pos[2].exists():
-        try:
-            parse_indexed_pattern(pos[2].name)
-            is_pattern_mode = True
-            p0_type = get_file_type(pos[0])
-            p1_type = get_file_type(pos[1])
-            if p0_type == "n" and p1_type == "a":
-                null_path = pos[0]
-                alt_path = pos[1]
-            elif p0_type == "a" and p1_type == "n":
-                null_path = pos[1]
-                alt_path = pos[0]
-            else:
-                null_path = pos[0]
-                alt_path = pos[1]
-            pattern_raw = pos[2].name
-        except SystemExit:
-            is_pattern_mode = False
+        is_pattern_mode = True
+        p0_type = get_file_type(pos[0])
+        p1_type = get_file_type(pos[1])
+        if p0_type == "n" and p1_type == "a":
+            null_path = pos[0]
+            alt_path = pos[1]
+        elif p0_type == "a" and p1_type == "n":
+            null_path = pos[1]
+            alt_path = pos[0]
+        else:
+            null_path = pos[0]
+            alt_path = pos[1]
+        
+        p3_str = pos[2].name
+        if "/" in p3_str or p3_str.replace('.', '', 1).isdigit():
+            proportion_raw = p3_str
+        else:
+            pattern_raw = p3_str
     elif len(pos) == 1 or (len(pos) == 2 and not pos[1].exists()):
-        # Single sequence file or single alt + pattern
+        # Single sequence file or single alt + pattern/proportion
         single_file = pos[0]
         p_type = get_file_type(single_file)
         if p_type == "a" or ("admixture" in single_file.name or "recombination" in single_file.name or "10X" in single_file.name or "10x" in single_file.name or single_file.name.startswith("N")):
             is_pattern_mode = True
             alt_path = single_file
             if len(pos) == 2 and not pos[1].exists():
-                pattern_raw = pos[1].name
-            else:
-                pattern_raw = None
+                p2_str = pos[1].name
+                if "/" in p2_str or p2_str.replace('.', '', 1).isdigit():
+                    proportion_raw = p2_str
+                else:
+                    pattern_raw = p2_str
         elif len(pos) == 2 and not pos[1].exists():
-            try:
-                parse_indexed_pattern(pos[1].name)
-                pattern_raw = pos[1].name
-                alt_path = single_file
-                is_pattern_mode = True
-            except SystemExit:
-                is_pattern_mode = False
+            is_pattern_mode = True
+            alt_path = single_file
+            p2_str = pos[1].name
+            if "/" in p2_str or p2_str.replace('.', '', 1).isdigit():
+                proportion_raw = p2_str
+            else:
+                pattern_raw = p2_str
 
         if is_pattern_mode:
             null_path = args.null if args.null else Path("null")
-
-            target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+            target_files, _, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw)
         else:
             target_files = [single_file]
 
     target_files = [] if not ('target_files' in locals()) else target_files
 
     if is_pattern_mode and not target_files:
-        target_files, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+        target_files, _, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw)
     elif not is_pattern_mode and not target_files:
         if len(pos) >= 2:
             target_files = pos
@@ -745,7 +779,9 @@ def main(argv=None):
     if is_pattern_mode:
         concat_argv = ["-n", str(null_path), "-a", str(alt_path)]
         if pattern_raw:
-            concat_argv.extend(["-p", pattern_raw])
+            concat_argv.extend(["--pattern", pattern_raw])
+        if proportion_raw:
+            concat_argv.extend(["-p", str(proportion_raw)])
     else:
         concat_argv = [str(f) for f in processed_files]
 
@@ -759,3 +795,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+

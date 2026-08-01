@@ -200,9 +200,10 @@ def build_rle_pattern(file_types: list[str]) -> str:
     return "".join(result)
 
 
-def get_file_type(f: Path) -> str:
+def get_file_type(f: str | Path) -> str:
     s = str(f).lower()
-    if "anomaly" in s or "alt" in s or "anom" in s or "admixture" in s or "recombination" in s or "10x" in s:
+    name = Path(f).name.lower()
+    if name.startswith("a") or "anomaly" in s or "alt" in s or "anom" in s or "admixture" in s or "recombination" in s or "10x" in s:
         return "a"
     return "n"
 
@@ -214,10 +215,12 @@ def strip_chunk_index(stem: str) -> str:
 
 
 def get_chunk_index(stem: str) -> str:
-    """Extracts numeric chunk index from base name (e.g., '5' from null-5 or legacy default-500Kb-5)."""
+    """Extracts numeric chunk index from base name (e.g., '5' from null-5 or 'a2' or legacy default-500Kb-5)."""
     m = re.search(r"-(\d+)(?:-[^/]+)?$", stem)
     if not m:
         m = re.search(r"-(\d+)-", stem)
+    if not m:
+        m = re.search(r"(\d+)", stem)
     return m.group(1) if m else ""
 
 
@@ -309,48 +312,121 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list
 import random
 
 
-def parse_pattern_to_12_chunks(pattern_raw: str | None) -> tuple[list[tuple[str, str]], str]:
+def parse_proportion(prop_raw: str | float | None) -> float | None:
+    if prop_raw is None or prop_raw == "":
+        return None
+    if isinstance(prop_raw, (int, float)):
+        val = float(prop_raw)
+    else:
+        s = str(prop_raw).strip()
+        if "/" in s:
+            parts = s.split("/")
+            val = float(parts[0]) / float(parts[1])
+        else:
+            val = float(s)
+
+    if val > 1.0 and val <= 12:
+        return val / 12.0
+    return val
+
+
+def parse_alt_pattern(pattern_raw: str | None) -> list[str]:
     """
-    Parses a pattern string, single count digit, or None into 12 chunk items.
-    Returns (pattern_items, suffix_label).
-      - If pattern_raw is None or empty: 3 alt chunks inserted randomly into 12, suffix_label = ""
-      - If pattern_raw is a digit string (e.g., '3' or '5'): n alt chunks inserted randomly into 12, suffix_label = "{n}a"
-      - If pattern_raw is a pattern string: validated to ensure exactly 12 chunks total, suffix_label = pattern_raw
+    Parses alt pattern string (e.g. 'a2a1a3' or 'a1a2a3' or '2,1,3') into list of alt chunk index strings.
+    If pattern_raw is None or empty, defaults to increasing chunk indices ['1', '2', ..., '12'].
     """
-    if pattern_raw is None or pattern_raw == "":
-        start_idx = random.randint(0, 9)
-        alt_positions = set(range(start_idx, start_idx + 3))
-        pattern_items = [("a" if i in alt_positions else "n", "") for i in range(12)]
-        return pattern_items, ""
+    if not pattern_raw:
+        return [str(i) for i in range(1, 13)]
 
-    pattern_raw_str = str(pattern_raw).strip()
-    if pattern_raw_str.isdigit():
-        n_alt = int(pattern_raw_str)
-        if not (0 <= n_alt <= 12):
-            sys.exit(f"Error: Number of alternative chunks must be between 0 and 12, got {n_alt}.")
-        start_idx = random.randint(0, max(0, 12 - n_alt))
-        alt_positions = set(range(start_idx, start_idx + n_alt))
-        pattern_items = [("a" if i in alt_positions else "n", "") for i in range(12)]
-        return pattern_items, f"{n_alt}a"
+    pattern_str = str(pattern_raw).strip().lower()
+    matches = re.findall(r"a?(\d+)", pattern_str)
+    if not matches:
+        return [str(i) for i in range(1, 13)]
 
-    # Parse indexed or RLE/character pattern string
-    pattern_items = parse_indexed_pattern(pattern_raw_str)
-    
-    total_chunks = len(pattern_items)
-    if total_chunks != 12:
-        sys.exit(f"Error: Pattern must specify exactly 12 chunks total for a 6Mbp sequence (got {total_chunks} chunks in '{pattern_raw_str}').")
+    return matches
 
-    return pattern_items, pattern_raw_str
+
+def format_prop_decimal(prop_val: float) -> str:
+    val_str = f"{round(prop_val, 4):g}"
+    if "." not in val_str:
+        val_str = f"{val_str}.0"
+    return val_str
+
+
+def parse_pattern_to_12_chunks(
+    pattern_raw: str | None, prop_raw: str | float | None = None
+) -> tuple[list[tuple[str, str]], str, float]:
+    """
+    Parses pattern string and/or proportion into 12 chunk items.
+    Returns (pattern_items, suffix_label, prop_val).
+      - If pattern_raw contains 'n' and specifies 12 chunks (e.g. 'a1n2a3n4...'), it is used directly.
+      - Otherwise, alt chunks are placed via random insertion rule (random start_idx) in 12 chunks.
+    """
+    prop_val = parse_proportion(prop_raw)
+    pattern_str = str(pattern_raw).strip() if pattern_raw else ""
+
+    # 1. Full 12-chunk pattern with nulls specified
+    if "n" in pattern_str.lower():
+        try:
+            pattern_items = parse_indexed_pattern(pattern_str)
+            if len(pattern_items) == 12:
+                num_alt = sum(1 for t, _ in pattern_items if t == "a")
+                if prop_val is None:
+                    prop_val = num_alt / 12.0
+                suffix_label = build_indexed_pattern([Path(f"{t}{idx}") for t, idx in pattern_items])
+                return pattern_items, suffix_label, prop_val
+        except SystemExit:
+            pass
+
+    # 2. Alt-only or omitted nulls -> random insertion rule
+    alt_chunks = parse_alt_pattern(pattern_raw)
+
+    if prop_val is not None:
+        num_alt_chunks = int(round(prop_val * 12))
+    elif pattern_raw:
+        num_alt_chunks = len(alt_chunks)
+    else:
+        num_alt_chunks = 3  # Default 3 alt chunks out of 12 (0.25 proportion)
+
+    num_alt_chunks = max(0, min(12, num_alt_chunks))
+    if prop_val is None:
+        prop_val = num_alt_chunks / 12.0
+
+    # Fill remaining up to num_alt_chunks with unused increasing indices if pattern specified fewer
+    if len(alt_chunks) < num_alt_chunks:
+        used = set(alt_chunks)
+        for i in range(1, 13):
+            if len(alt_chunks) >= num_alt_chunks:
+                break
+            if str(i) not in used:
+                alt_chunks.append(str(i))
+
+    selected_alt_chunks = alt_chunks[:num_alt_chunks]
+
+    # Random insertion rule: pick a random starting index for the contiguous block of alt chunks
+    start_idx = random.randint(0, max(0, 12 - num_alt_chunks))
+
+    pattern_items = []
+    alt_ptr = 0
+    for i in range(12):
+        if start_idx <= i < start_idx + num_alt_chunks:
+            pattern_items.append(("a", selected_alt_chunks[alt_ptr]))
+            alt_ptr += 1
+        else:
+            pattern_items.append(("n", str(i + 1)))
+
+    suffix_label = build_indexed_pattern([Path(f"{t}{idx}") for t, idx in pattern_items])
+    return pattern_items, suffix_label, prop_val
 
 
 def expand_pattern_to_target_files(
-    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path
-) -> tuple[list[Path], str]:
+    null_path: Path, alt_path: Path, pattern_raw: str | None, output_dir: Path, proportion: str | float | None = None
+) -> tuple[list[Path], str, float]:
     """
-    Expands a pattern string into concrete target file paths for 12 chunks (6Mbp total).
-    Returns (target_files, suffix_label).
+    Expands a pattern string and proportion into concrete target file paths for 12 chunks (6Mbp total).
+    Returns (target_files, suffix_label, prop_val).
     """
-    pattern_items, suffix_label = parse_pattern_to_12_chunks(pattern_raw)
+    pattern_items, suffix_label, prop_val = parse_pattern_to_12_chunks(pattern_raw, prop_raw=proportion)
     null_indices = find_existing_chunk_indices(null_path, output_dir)
     alt_indices = find_existing_chunk_indices(alt_path, output_dir)
 
@@ -371,24 +447,18 @@ def expand_pattern_to_target_files(
             ptr += 1
             target_files.append(construct_indexed_path(base_p, idx_val))
         else:
-            val = int(num_str)
-            if indices and val in indices:
-                target_files.append(construct_indexed_path(base_p, num_str))
-                ptr = (indices.index(val) + 1) % len(indices)
+            target_files.append(construct_indexed_path(base_p, num_str))
+            if indices and int(num_str) in indices:
+                ptr = (indices.index(int(num_str)) + 1) % len(indices)
             else:
-                if indices:
-                    idx_val = str(indices[ptr % len(indices)])
-                else:
-                    idx_val = str(ptr + 1)
                 ptr += 1
-                target_files.append(construct_indexed_path(base_p, idx_val))
 
         if ftype == "n":
             null_ptr = ptr
         else:
             alt_ptr = ptr
 
-    return target_files, suffix_label
+    return target_files, suffix_label, prop_val
 
 
 def main(argv=None):
@@ -400,7 +470,7 @@ def main(argv=None):
         "positional_args",
         type=str,
         nargs="*",
-        help="Sequence files to concatenate: (null, alt, [pattern_or_count]) or 12 individual files.",
+        help="Sequence files to concatenate: (null, alt, [pattern_or_proportion]) or 12 individual files.",
     )
 
     parser.add_argument("-n", "--null", type=Path, help="Base name or path to null sequence.")
@@ -414,7 +484,14 @@ def main(argv=None):
         help="Base name or path to alternative sequence.",
     )
     parser.add_argument(
-        "-p", "--pattern", type=str, help="Pattern string (e.g. 'aanannnnaann'), single count n (e.g. '3'), or omitted for default 3 alt chunks."
+        "-p", "--prop", "--proportion",
+        dest="proportion",
+        type=str,
+        default=None,
+        help="Proportion of alternative sequence (e.g. 0.25, 0.5, 3/12)."
+    )
+    parser.add_argument(
+        "--pattern", type=str, default=None, help="Alternative pattern string specifying alt chunk order (e.g. 'a2a1a3' or 'a1a2a3')."
     )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
 
@@ -426,14 +503,14 @@ def main(argv=None):
 
     null_path = None
     alt_path = None
-    pattern_raw = None
+    pattern_raw = args.pattern
+    proportion_raw = args.proportion
     is_pair_mode = False
 
     if args.null and args.alt:
         is_pair_mode = True
         null_path = args.null
         alt_path = args.alt
-        pattern_raw = args.pattern
     elif len(pos) >= 2 and len(pos) <= 3:
         is_pair_mode = True
         p0_type = get_file_type(pos[0])
@@ -449,17 +526,21 @@ def main(argv=None):
             alt_path = pos[1]
 
         if len(pos) == 3:
-            pattern_raw = pos[2].name
+            p3_str = pos[2].name
+            if parse_proportion(p3_str) is not None:
+                proportion_raw = p3_str
+            else:
+                pattern_raw = p3_str
     elif len(pos) == 1 or (args.alt and not args.null):
         is_pair_mode = True
         alt_path = args.alt if args.alt else pos[0]
-        pattern_raw = args.pattern if args.pattern else None
-        
         if null_path is None:
-            sys.exit("Error: Null sequence path (-n/--null) must be provided.")
+            null_path = Path("null")
 
     if is_pair_mode:
-        files_to_concat, suffix_label = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir)
+        files_to_concat, suffix_label, prop_val = expand_pattern_to_target_files(
+            null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw
+        )
         resolved_files = [resolve_fasta_file(f, output_dir) for f in files_to_concat]
         fastas = []
         for rf in resolved_files:
@@ -475,7 +556,9 @@ def main(argv=None):
 
         exp_folder_name = get_experiment_folder_name(alt_path if alt_path else null_path)
         exp_dir = output_dir / exp_folder_name
-        concat_dir = exp_dir / "concat"
+
+        prop_dec_str = format_prop_decimal(prop_val)
+        concat_dir = exp_dir / f"concat_{prop_dec_str}"
         concat_dir.mkdir(parents=True, exist_ok=True)
 
         file_types = [get_file_type(f) for f in files_to_concat]
@@ -483,10 +566,15 @@ def main(argv=None):
         pattern_txt_content = pattern_str if pattern_str else (suffix_label if suffix_label else "")
 
         if args.output is None:
-            output_name = f"{pattern_txt_content}.fa" if pattern_txt_content else f"{exp_folder_name}.fa"
+            output_name = f"{pattern_txt_content}_{prop_dec_str}.fa" if pattern_txt_content else f"{exp_folder_name}_{prop_dec_str}.fa"
             output_path = concat_dir / output_name
         elif not args.output.is_absolute():
-            output_path = concat_dir / args.output.name
+            output_name = args.output.name
+            if not output_name.endswith(f"_{prop_dec_str}.fa") and not output_name.endswith(f"_{prop_dec_str}.fasta"):
+                stem = get_base_name(output_name)
+                ext = Path(output_name).suffix or ".fa"
+                output_name = f"{stem}_{prop_dec_str}{ext}"
+            output_path = concat_dir / output_name
         else:
             output_path = args.output
 
