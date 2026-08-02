@@ -156,6 +156,41 @@ def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
     sys.exit(f"Error: Sequence FASTA file does not exist for base name: '{bname}' ({f})")
 
 
+def ensure_null_12mb_block(output_dir: Path) -> Path:
+    """
+    Creates/retrieves a 12Mbps (12 x 500Kb chunks) null concatenated block saved in output_dir/null/n1n2n3n4n5n6n7n8n9n10n11n12.fa.
+    """
+    null_dir = output_dir / "null" / "concat"
+    null_dir.mkdir(parents=True, exist_ok=True)
+    null_12mb_path = null_dir / "n1n2n3n4n5n6n7n8n9n10n11n12.fa"
+    legacy_path = output_dir / "null" / "null_12mb.fa"
+
+    if null_12mb_path.exists():
+        return null_12mb_path
+    if legacy_path.exists():
+        return legacy_path
+
+    # Concatenate null chunks 1..12
+    null_chunk_files = [resolve_fasta_file(Path(f"null-{i}"), output_dir) for i in range(1, 13)]
+    fastas = [read_fasta(f) for f in null_chunk_files]
+
+    base_headers = list(fastas[0].keys())
+    for idx, fa in enumerate(fastas[1:], start=2):
+        missing = set(base_headers) - set(fa.keys())
+        extra = set(fa.keys()) - set(base_headers)
+        if missing or extra:
+            sys.exit(f"Error: Header mismatch in null chunk #{idx} ({null_chunk_files[idx-1]}): missing={missing}, extra={extra}")
+
+    print(f"Creating 12Mbps null block -> {null_12mb_path}...", file=sys.stderr)
+    with open(null_12mb_path, "w") as f:
+        for header in base_headers:
+            f.write(f">{header}\n")
+            seq_concat = "".join(fa[header] for fa in fastas)
+            f.write(f"{seq_concat}\n")
+
+    return null_12mb_path
+
+
 def mix_sequences(null_seq: str, alt_seq: str, pattern: str) -> str:
     pieces = []
     for char in pattern:
@@ -312,6 +347,66 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list
 import random
 
 
+def build_interleaved_pattern_string(np_pattern: str, ap_pattern: str, intervals: list[tuple[float, float]] | None) -> str:
+    np_matches = re.findall(r'n\d+', np_pattern.lower())
+    null_chunks = np_matches if np_matches else [f"n{i}" for i in range(1, 13)]
+
+    ap_matches = re.findall(r'a\d+', ap_pattern.lower())
+    alt_chunks = ap_matches if ap_matches else [f"a{i}" for i in range(1, 4)]
+
+    if not intervals:
+        intervals = [(0.0, 25.0)]
+
+    sorted_intervals = sorted(intervals, key=lambda x: x[0])
+    
+    total_alt_pct = sum(e - s for s, e in sorted_intervals)
+
+    M = len(null_chunks)
+    null_chunk_starts = [i * (100.0 / M) for i in range(M)]
+
+    K = len(alt_chunks)
+    alt_chunk_starts = [j * (total_alt_pct / K) for j in range(K)] if total_alt_pct > 0 else []
+
+    tokens = []
+    last_null_idx = -1
+    last_alt_idx = -1
+
+    current_null_prog = 0.0
+    current_alt_prog = 0.0
+
+    curr_pos = 0.0
+    for st, end in sorted_intervals:
+        null_len = st - curr_pos
+        if null_len > 0:
+            null_end_prog = current_null_prog + null_len
+            for i in range(M):
+                if i > last_null_idx and null_chunk_starts[i] < null_end_prog - 1e-7:
+                    tokens.append(null_chunks[i])
+                    last_null_idx = i
+            current_null_prog = null_end_prog
+
+        alt_len = end - st
+        if alt_len > 0 and K > 0:
+            alt_end_prog = current_alt_prog + alt_len
+            for j in range(K):
+                if j > last_alt_idx and alt_chunk_starts[j] < alt_end_prog - 1e-7:
+                    tokens.append(alt_chunks[j])
+                    last_alt_idx = j
+            current_alt_prog = alt_end_prog
+
+        curr_pos = end
+
+    remaining_null_len = 100.0 - curr_pos
+    if remaining_null_len > 0:
+        null_end_prog = current_null_prog + remaining_null_len
+        for i in range(M):
+            if i > last_null_idx and null_chunk_starts[i] < null_end_prog - 1e-7:
+                tokens.append(null_chunks[i])
+                last_null_idx = i
+
+    return "".join(tokens)
+
+
 def parse_proportion(prop_raw: str | float | None) -> float | None:
     if prop_raw is None or prop_raw == "":
         return None
@@ -346,6 +441,38 @@ def parse_alt_pattern(pattern_raw: str | None) -> list[str]:
     return matches
 
 
+def parse_interval_pattern(pattern_raw: str) -> list[tuple[int, int]] | None:
+    """
+    Parses start1_end1_start2_end2... pattern (e.g. '500_1000_1500_2000' or '500kb_1000kb')
+    into list of (start_bp, end_bp) tuples.
+    Returns None if pattern_raw is not an interval pattern.
+    """
+    if not pattern_raw:
+        return None
+    s = pattern_raw.strip().lower()
+    # Check if string matches start_end format with underscores/dashes/commas
+    parts = [p.strip() for p in re.split(r"[_,-]", s) if p.strip()]
+    if not parts or len(parts) % 2 != 0:
+        return None
+
+    intervals = []
+    for i in range(0, len(parts), 2):
+        p_start, p_end = parts[i], parts[i + 1]
+        try:
+            mult_start = 1000 if "kb" in p_start else (1000000 if "mb" in p_start else 1)
+            mult_end = 1000 if "kb" in p_end else (1000000 if "mb" in p_end else 1)
+            val_start = int(float(re.sub(r"[^\d.]", "", p_start)) * mult_start)
+            val_end = int(float(re.sub(r"[^\d.]", "", p_end)) * mult_end)
+            if val_start < val_end:
+                intervals.append((val_start, val_end))
+            else:
+                return None
+        except ValueError:
+            return None
+
+    return intervals if intervals else None
+
+
 def format_prop_decimal(prop_val: float) -> str:
     val_str = f"{round(prop_val, 4):g}"
     if "." not in val_str:
@@ -357,20 +484,58 @@ def parse_pattern_to_12_chunks(
     pattern_raw: str | None, prop_raw: str | float | None = None
 ) -> tuple[list[tuple[str, str]], str, float]:
     """
-    Parses pattern string and/or proportion into 12 chunk items.
+    Parses chunk-based pattern string and/or proportion into 12 chunk items.
     Returns (pattern_items, suffix_label, prop_val).
-      - If pattern_raw contains 'n' and specifies 12 chunks (e.g. 'a1n2a3n4...'), it is used directly.
-      - Otherwise, alt chunks are placed via random insertion rule (random start_idx) in 12 chunks.
     """
     prop_val = parse_proportion(prop_raw)
     pattern_str = str(pattern_raw).strip() if pattern_raw else ""
 
-    # 1. Full 12-chunk pattern with nulls specified
+    # Check if pattern string lacks chunk indices (e.g. 'a', 'a1a2', etc.)
+    has_explicit_indices = bool(re.search(r"[na]\d+", pattern_str.lower()))
+
+    # If pattern string has no chunk indices, use 12Mbps null concatenated block for insertion
+    if pattern_str and not has_explicit_indices and "n" not in pattern_str.lower():
+        # User specified alt pattern without chunk indices (e.g. 'a') or positional intervals
+        alt_chunks = parse_alt_pattern(pattern_raw)
+        if prop_val is not None:
+            num_alt_chunks = int(round(prop_val * 12))
+        else:
+            num_alt_chunks = len(alt_chunks)
+        num_alt_chunks = max(1, min(12, num_alt_chunks))
+        if prop_val is None:
+            prop_val = num_alt_chunks / 12.0
+
+        pattern_items = [("n1n2n3n4n5n6n7n8n9n10n11n12", "")]
+        for i in range(1, num_alt_chunks + 1):
+            pattern_items.append(("a", str(i)))
+        suffix_label = f"n1n2n3n4n5n6n7n8n9n10n11n12_{pattern_str}" if pattern_str else f"n1n2n3n4n5n6n7n8n9n10n11n12_a{num_alt_chunks}"
+        return pattern_items, suffix_label, prop_val
+
+    # 1. Pattern with explicit 'n' specified
     if "n" in pattern_str.lower():
         try:
-            pattern_items = parse_indexed_pattern(pattern_str)
-            if len(pattern_items) == 12:
+            parsed = parse_indexed_pattern(pattern_str)
+            if len(parsed) <= 12:
+                pattern_items = list(parsed)
+                # Fill remaining positions up to 12 with increasing null chunk indices ('n')
+                if len(pattern_items) < 12:
+                    curr_pos = len(pattern_items)
+                    for idx in range(curr_pos + 1, 13):
+                        pattern_items.append(("n", str(idx)))
+                
+                # Assign default indices to any unindexed 'n' or 'a' entries based on position/occurrence
+                final_items = []
+                for i, (t, idx) in enumerate(pattern_items, start=1):
+                    if not idx:
+                        idx = str(i)
+                    final_items.append((t, idx))
+                pattern_items = final_items
+
                 num_alt = sum(1 for t, _ in pattern_items if t == "a")
+                if prop_raw is not None and prop_val is not None:
+                    requested_alt_chunks = int(round(prop_val * 12))
+                    if requested_alt_chunks > num_alt:
+                        sys.exit(f"Error: Specified proportion {prop_raw} ({requested_alt_chunks} alt chunk(s)) is greater than the number of alternative ('a') chunks in pattern '{pattern_raw}' ({num_alt} chunk(s)).")
                 if prop_val is None:
                     prop_val = num_alt / 12.0
                 suffix_label = build_indexed_pattern([Path(f"{t}{idx}") for t, idx in pattern_items])
@@ -383,6 +548,8 @@ def parse_pattern_to_12_chunks(
 
     if prop_val is not None:
         num_alt_chunks = int(round(prop_val * 12))
+        if pattern_raw and len(alt_chunks) < num_alt_chunks:
+            sys.exit(f"Error: Specified proportion {prop_raw} ({num_alt_chunks} alt chunk(s)) is greater than the number of alternative ('a') chunks in pattern '{pattern_raw}' ({len(alt_chunks)} chunk(s)).")
     elif pattern_raw:
         num_alt_chunks = len(alt_chunks)
     else:
@@ -403,8 +570,8 @@ def parse_pattern_to_12_chunks(
 
     selected_alt_chunks = alt_chunks[:num_alt_chunks]
 
-    # Random insertion rule: pick a random starting index for the contiguous block of alt chunks
-    start_idx = random.randint(0, max(0, 12 - num_alt_chunks))
+    # Alt chunk insertion rule: start alt chunks from position 0
+    start_idx = 0
 
     pattern_items = []
     alt_ptr = 0
@@ -427,15 +594,15 @@ def expand_pattern_to_target_files(
     Returns (target_files, suffix_label, prop_val).
     """
     pattern_items, suffix_label, prop_val = parse_pattern_to_12_chunks(pattern_raw, prop_raw=proportion)
-    null_indices = find_existing_chunk_indices(null_path, output_dir)
-    alt_indices = find_existing_chunk_indices(alt_path, output_dir)
+    null_indices = find_existing_chunk_indices(null_path if null_path else Path("null"), output_dir)
+    alt_indices = find_existing_chunk_indices(alt_path, output_dir) if alt_path else []
 
     null_ptr = 0
     alt_ptr = 0
     target_files = []
 
     for ftype, num_str in pattern_items:
-        base_p = null_path if ftype == "n" else alt_path
+        base_p = (null_path if null_path else Path("null")) if ftype == "n" else (alt_path if alt_path else Path("alt"))
         indices = null_indices if ftype == "n" else alt_indices
         ptr = null_ptr if ftype == "n" else alt_ptr
 
@@ -491,7 +658,10 @@ def main(argv=None):
         help="Proportion of alternative sequence (e.g. 0.25, 0.5, 3/12)."
     )
     parser.add_argument(
-        "--pattern", type=str, default=None, help="Alternative pattern string specifying alt chunk order (e.g. 'a2a1a3' or 'a1a2a3')."
+        "--np", "--null-pattern", type=str, default="n1n2n3n4n5n6n7n8n9n10n11n12", help="Null pattern string specifying null chunk order."
+    )
+    parser.add_argument(
+        "--ap", "--alt-pattern", type=str, default="a1a2a3", help="Alternative pattern string specifying alt chunk order."
     )
     parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
 
@@ -501,93 +671,193 @@ def main(argv=None):
 
     pos = [Path(p) for p in args.positional_args]
 
-    null_path = None
-    alt_path = None
-    pattern_raw = args.pattern
-    proportion_raw = args.proportion
     is_pair_mode = False
+    null_path = args.null
+    alt_path = args.alt
 
-    if args.null and args.alt:
-        is_pair_mode = True
-        null_path = args.null
-        alt_path = args.alt
-    elif len(pos) >= 2 and len(pos) <= 3:
-        is_pair_mode = True
-        p0_type = get_file_type(pos[0])
-        p1_type = get_file_type(pos[1])
-        if p0_type == "n" and p1_type == "a":
-            null_path = pos[0]
-            alt_path = pos[1]
-        elif p0_type == "a" and p1_type == "n":
-            null_path = pos[1]
-            alt_path = pos[0]
+    # Extract any positional arguments that are intervals
+    intervals_raw = []
+    file_pos = []
+    for p in pos:
+        if bool(re.match(r"^[\d\.,\-_kmb]+$", p.name.lower().strip())):
+            intervals_raw.append(p.name)
         else:
-            null_path = pos[0]
-            alt_path = pos[1]
+            file_pos.append(p)
+    
+    args.interval = ",".join(intervals_raw) if intervals_raw else None
 
-        if len(pos) == 3:
-            p3_str = pos[2].name
-            if parse_proportion(p3_str) is not None:
-                proportion_raw = p3_str
-            else:
-                pattern_raw = p3_str
-    elif len(pos) == 1 or (args.alt and not args.null):
+    if null_path or alt_path or args.interval or len(file_pos) <= 3:
         is_pair_mode = True
-        alt_path = args.alt if args.alt else pos[0]
+        if file_pos and not null_path:
+            null_path = file_pos[0]
+        if len(file_pos) > 1 and not alt_path:
+            alt_path = file_pos[1]
+        
         if null_path is None:
             null_path = Path("null")
 
     if is_pair_mode:
-        files_to_concat, suffix_label, prop_val = expand_pattern_to_target_files(
-            null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw
-        )
-        resolved_files = [resolve_fasta_file(f, output_dir) for f in files_to_concat]
-        fastas = []
-        for rf in resolved_files:
-            print(f"Reading FASTA: {rf}", file=sys.stderr)
-            fastas.append(read_fasta(rf))
+        intervals = parse_interval_pattern(args.interval) if args.interval else None
+        
+        # 1. Load the null base sequence
+        if null_path and str(null_path).lower() != "null":
+            base_null_fa = resolve_fasta_file(null_path, output_dir)
+            null_fastas = read_fasta(base_null_fa)
+        else:
+            matches = re.findall(r'[an](\d+)', args.np.lower())
+            null_chunk_indices = [int(m) for m in matches] if matches else [i for i in range(1, 13)]
+            
+            null_fastas = {}
+            for idx in null_chunk_indices:
+                cf = output_dir / "null" / "simulated" / f"{idx}.fa"
+                if not cf.exists():
+                    cf = ensure_null_12mb_block(output_dir)
+                    null_fastas = read_fasta(cf)
+                    break
+                else:
+                    rf = read_fasta(cf)
+                    for header, seq in rf.items():
+                        if header not in null_fastas:
+                            null_fastas[header] = ""
+                        null_fastas[header] += seq
 
-        base_headers = list(fastas[0].keys())
-        for idx, fa in enumerate(fastas[1:], start=2):
-            missing = set(base_headers) - set(fa.keys())
-            extra = set(fa.keys()) - set(base_headers)
-            if missing or extra:
-                sys.exit(f"Error: Header mismatch in file #{idx} ({resolved_files[idx-1]}): missing={missing}, extra={extra}")
+        base_headers = list(null_fastas.keys())
 
-        exp_folder_name = get_experiment_folder_name(alt_path if alt_path else null_path)
+        # 2. Load the alt chunks
+        alt_fastas = {}
+        if alt_path and str(alt_path).lower() != "null":
+            matches = re.findall(r'[an](\d+)', args.ap.lower())
+            alt_chunk_indices = [int(m) for m in matches] if matches else [1, 2, 3]
+            
+            for idx in alt_chunk_indices:
+                cf = construct_indexed_path(alt_path, str(idx))
+                rf = resolve_fasta_file(cf, output_dir)
+                chunk_data = read_fasta(rf)
+                for header in base_headers:
+                    if header not in alt_fastas:
+                        alt_fastas[header] = ""
+                    alt_fastas[header] += chunk_data.get(header, "")
+
+        exp_folder_name = get_experiment_folder_name(alt_path) if alt_path and str(alt_path).lower() != "null" else "null"
         exp_dir = output_dir / exp_folder_name
-
-        prop_dec_str = format_prop_decimal(prop_val)
-        concat_dir = exp_dir / f"concat_{prop_dec_str}"
+        concat_dir = exp_dir / "concat"
         concat_dir.mkdir(parents=True, exist_ok=True)
 
-        file_types = [get_file_type(f) for f in files_to_concat]
-        pattern_str = build_indexed_pattern(files_to_concat)
-        pattern_txt_content = pattern_str if pattern_str else (suffix_label if suffix_label else "")
+        if intervals:
+            total_null_bp = sum(len(seq) for seq in null_fastas.values()) // len(base_headers) if base_headers else 6000000
+            
+            parsed_intervals = []
+            pct_intervals = []
+            for start_val, end_val in intervals:
+                if end_val <= 100:
+                    st = int((start_val / 100.0) * total_null_bp)
+                    length = int(((end_val - start_val) / 100.0) * total_null_bp)
+                    pct_intervals.append((float(start_val), float(end_val)))
+                else:
+                    st = start_val
+                    length = end_val - start_val
+                    pct_st = (start_val / float(total_null_bp)) * 100.0
+                    pct_end = (end_val / float(total_null_bp)) * 100.0
+                    pct_intervals.append((pct_st, pct_end))
+                parsed_intervals.append((st, length))
 
-        if args.output is None:
-            output_name = f"{pattern_txt_content}_{prop_dec_str}.fa" if pattern_txt_content else f"{exp_folder_name}_{prop_dec_str}.fa"
+            total_alt_bp = sum(length for _, length in parsed_intervals)
+
+            is_custom_np = args.np != "n1n2n3n4n5n6n7n8n9n10n11n12"
+            is_custom_ap = args.ap != "a1a2a3"
+
+            if args.output is None:
+                interval_labels = []
+                if intervals:
+                    for st_v, end_v in intervals:
+                        st_s = f"{int(st_v)}" if int(st_v) == st_v else f"{st_v}"
+                        end_s = f"{int(end_v)}" if int(end_v) == end_v else f"{end_v}"
+                        interval_labels.append(f"{st_s}-{end_s}")
+                interval_str_label = ",".join(interval_labels) if interval_labels else ""
+
+                if is_custom_np or is_custom_ap:
+                    pattern_stem = build_interleaved_pattern_string(args.np, args.ap, pct_intervals)
+                    output_stem = f"{pattern_stem}_{interval_str_label}" if interval_str_label else pattern_stem
+                elif interval_str_label:
+                    output_stem = interval_str_label
+                else:
+                    output_stem = exp_folder_name
+                output_name = f"{output_stem}.fa"
+            else:
+                output_name = args.output.name
             output_path = concat_dir / output_name
-        elif not args.output.is_absolute():
-            output_name = args.output.name
-            if not output_name.endswith(f"_{prop_dec_str}.fa") and not output_name.endswith(f"_{prop_dec_str}.fasta"):
-                stem = get_base_name(output_name)
-                ext = Path(output_name).suffix or ".fa"
-                output_name = f"{stem}_{prop_dec_str}{ext}"
-            output_path = concat_dir / output_name
+
+            print(f"Applying {len(intervals)} interval insertions (total length: {total_alt_bp} bp) to {args.np} block...", file=sys.stderr)
+            with open(output_path, "w") as f:
+                for header in base_headers:
+                    f.write(f">{header}\n")
+                    null_seq = null_fastas[header]
+                    alt_seq = alt_fastas.get(header, null_seq)
+                    
+                    alt_sub = alt_seq[:total_alt_bp] if len(alt_seq) >= total_alt_bp else (alt_seq * (total_alt_bp // max(1, len(alt_seq)) + 1))[:total_alt_bp]
+                    trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
+
+                    final_seq = []
+                    null_idx = 0
+                    alt_idx = 0
+                    
+                    sorted_intervals = sorted(parsed_intervals, key=lambda x: x[0])
+                    curr_pos = 0
+                    
+                    for st, length in sorted_intervals:
+                        null_len = st - curr_pos
+                        if null_len > 0:
+                            final_seq.append(null_seq[null_idx:null_idx + null_len])
+                            null_idx += null_len
+                            curr_pos += null_len
+                        
+                        alt_chunk = alt_sub[alt_idx:alt_idx + length]
+                        final_seq.append(alt_chunk)
+                        alt_idx += length
+                        curr_pos += length
+                    
+                    remaining_null_len = trimmed_null_length - null_idx
+                    if remaining_null_len > 0:
+                        final_seq.append(null_seq[null_idx:null_idx + remaining_null_len])
+
+                    f.write(f"{''.join(final_seq)}\n")
+
+            print(f"Writing output FASTA: {output_path}", file=sys.stderr)
+            print("Done.", file=sys.stderr)
+            return
         else:
-            output_path = args.output
+            is_pure_null = (not alt_path or str(alt_path).lower() == "null")
+            np_str = "" if args.np == "n1n2n3n4n5n6n7n8n9n10n11n12" else args.np
+            ap_str = "" if args.ap == "a1a2a3" else args.ap
 
-        print(f"Concatenating 12 sequence files (6Mbp total)...", file=sys.stderr)
-        with open(output_path, "w") as f:
-            for header in base_headers:
-                f.write(f">{header}\n")
-                seq_concat = "".join(fa[header] for fa in fastas)
-                f.write(f"{seq_concat}\n")
-
-        print(f"Writing output FASTA: {output_path}", file=sys.stderr)
-
-        print("Done.", file=sys.stderr)
+            if args.output is None:
+                parts = [np_str] if is_pure_null else [np_str, ap_str]
+                parts = [p for p in parts if p]
+                output_name = f"{'_'.join(parts)}.fa" if parts else f"{exp_folder_name}.fa"
+            else:
+                output_name = args.output.name
+            output_path = concat_dir / output_name
+            
+            with open(output_path, "w") as f:
+                for header in base_headers:
+                    f.write(f">{header}\n")
+                    if is_pure_null:
+                        f.write(f"{null_fastas[header]}\n")
+                    else:
+                        null_seq = null_fastas[header]
+                        alt_seq = alt_fastas.get(header, "")
+                        
+                        total_alt_bp = len(alt_seq)
+                        trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
+                        base_seq = list(null_seq[:trimmed_null_length])
+                        
+                        # Default insertion: prefix alt sequence
+                        base_seq[0:0] = list(alt_seq)
+                        
+                        f.write(f"{''.join(base_seq[:len(null_seq)])}\n")
+            print(f"Writing base FASTA: {output_path}", file=sys.stderr)
+            print("Done.", file=sys.stderr)
+            return
 
     elif len(pos) == 12:
         # Sequential concatenation of 12 explicit files

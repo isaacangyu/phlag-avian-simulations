@@ -25,10 +25,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from simulate_sequences import simulate_ts_to_fasta, get_output_dir
 from concat_sequences import (
-    parse_indexed_pattern,
     construct_indexed_path,
-    expand_pattern_to_target_files,
-    get_file_type,
+    find_existing_chunk_indices,
     get_phlag_dir,
     get_experiment_folder_name,
     get_chunk_index,
@@ -438,6 +436,13 @@ def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate:
     chunk_idx = get_chunk_index(base_name)
     simulated_name = f"{chunk_idx}.fa" if chunk_idx else f"{base_name}.fa"
 
+    # Throw error if alternative sequence chunk index > 3
+    s_lower = str(input_file).lower()
+    is_alt_by_name = input_file.name.lower().startswith("a") or any(kw in s_lower for kw in ("anomaly", "alt", "anom", "admixture", "recombination", "10x"))
+    is_alt = is_alt_by_name or (exp_name != "null" and input_file.name.startswith("alt"))
+    if is_alt and chunk_idx and chunk_idx.isdigit() and int(chunk_idx) > 3:
+        sys.exit(f"Error: Cannot simulate alternative chunk '{input_file.name}': chunk index {chunk_idx} exceeds maximum allowed index of 3.")
+
     sim_dir = output_dir / exp_name / "simulated"
     sim_dir.mkdir(parents=True, exist_ok=True)
 
@@ -569,7 +574,10 @@ def main(argv=None):
         help="Proportion of alternative sequence (e.g. 0.25, 0.5, 3/12)."
     )
     parser.add_argument(
-        "--pattern", type=str, default=None, help="Alternative pattern string specifying alt chunk order (e.g. 'a2a1a3' or 'a1a2a3')."
+        "--np", "--null-pattern", type=str, default="n1n2n3n4n5n6n7n8n9n10n11n12", help="Null pattern string specifying null chunk order."
+    )
+    parser.add_argument(
+        "--ap", "--alt-pattern", type=str, default="a1a2a3", help="Alternative pattern string specifying alt chunk order."
     )
     parser.add_argument(
         "-t", "--tree", "--input-tree",
@@ -647,81 +655,66 @@ def main(argv=None):
         args.alt = normalize_and_rename_file(args.alt)
     pos = [normalize_and_rename_file(Path(p)) for p in args.positional_args if p]
 
-    if args.null and not args.alt and pos:
-        args.alt = pos[0]
-        pos = pos[1:]
-    elif args.alt and not args.null and pos:
-        args.null = pos[0]
-        pos = pos[1:]
-
     # Determine input files for simulation / filtering / concat
-    is_pattern_mode = False
-    pattern_raw = args.pattern
-    proportion_raw = args.proportion
-
-    if args.null and args.alt:
-        is_pattern_mode = True
-        null_path = args.null
-        alt_path = args.alt
-    elif len(pos) == 3 and not pos[2].exists():
-        is_pattern_mode = True
-        p0_type = get_file_type(pos[0])
-        p1_type = get_file_type(pos[1])
-        if p0_type == "n" and p1_type == "a":
-            null_path = pos[0]
-            alt_path = pos[1]
-        elif p0_type == "a" and p1_type == "n":
-            null_path = pos[1]
-            alt_path = pos[0]
+    coord_parts = []
+    file_pos = []
+    for p in pos:
+        name_clean = p.name.lower().strip()
+        is_interval = bool(re.match(r"^[\d\.,\-_kmb]+$", name_clean))
+        if is_interval and not p.exists():
+            coord_parts.append(p.name)
         else:
-            null_path = pos[0]
-            alt_path = pos[1]
+            file_pos.append(p)
+
+    null_path = args.null
+    if not null_path and len(file_pos) > 1:
+        null_path = file_pos.pop(0)
+
+    alt_path = args.alt
+    if not alt_path and file_pos:
+        alt_path = file_pos.pop(0)
+
+    if not null_path:
+        null_path = Path("null")
+
+    if not coord_parts:
+        import random
+        start_perc = random.randint(0, 75)
+        end_perc = start_perc + 25
+        coord_parts = [f"{start_perc}-{end_perc}"]
+        print(f"No interval provided. Randomly selected interval: {coord_parts[0]}", file=sys.stderr)
+
+    interval_str = ",".join(coord_parts)
+
+    # is_pattern_mode is True if we are doing any kind of concatenation
+    # that involves `--np`, `--ap`, intervals, or proportions.
+    is_pattern_mode = True if (alt_path or coord_parts or args.np != "n1n2n3n4n5n6n7n8n9n10n11n12" or args.ap != "a1a2a3" or args.proportion) else False
+
+    target_files = []
+    if is_pattern_mode:
+        if alt_path:
+            # Parse needed alt chunks from --ap
+            matches = re.findall(r'[an](\d+)', args.ap.lower())
+            alt_chunk_indices = [int(m) for m in matches] if matches else [1, 2, 3]
+            exp_name = get_experiment_folder_name(alt_path)
+            for idx in alt_chunk_indices:
+                cf = output_dir / exp_name / "ts" / f"{idx}.ts"
+                target_files.append(cf)
+        else:
+            print("Note: No alternative sequence explicitly provided. Simulating null sequence blocks.", file=sys.stderr)
         
-        p3_str = pos[2].name
-        if "/" in p3_str or p3_str.replace('.', '', 1).isdigit():
-            proportion_raw = p3_str
-        else:
-            pattern_raw = p3_str
-    elif len(pos) == 1 or (len(pos) == 2 and not pos[1].exists()):
-        # Single sequence file or single alt + pattern/proportion
-        single_file = pos[0]
-        p_type = get_file_type(single_file)
-        if p_type == "a" or ("admixture" in single_file.name or "recombination" in single_file.name or "10X" in single_file.name or "10x" in single_file.name or single_file.name.startswith("N")):
-            is_pattern_mode = True
-            alt_path = single_file
-            if len(pos) == 2 and not pos[1].exists():
-                p2_str = pos[1].name
-                if "/" in p2_str or p2_str.replace('.', '', 1).isdigit():
-                    proportion_raw = p2_str
-                else:
-                    pattern_raw = p2_str
-        elif len(pos) == 2 and not pos[1].exists():
-            is_pattern_mode = True
-            alt_path = single_file
-            p2_str = pos[1].name
-            if "/" in p2_str or p2_str.replace('.', '', 1).isdigit():
-                proportion_raw = p2_str
-            else:
-                pattern_raw = p2_str
+        # Parse needed null chunks from --np
+        matches = re.findall(r'[an](\d+)', args.np.lower())
+        null_chunk_indices = [int(m) for m in matches] if matches else [i for i in range(1, 13)]
+        for idx in null_chunk_indices:
+            cf = output_dir / "null" / "ts" / f"{idx}.ts"
+            target_files.append(cf)
+    else:
+        target_files = [null_path] + [alt_path] if alt_path else [null_path]
 
-        if is_pattern_mode:
-            null_path = args.null if args.null else Path("null")
-            target_files, _, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw)
-        else:
-            target_files = [single_file]
-
-    target_files = [] if not ('target_files' in locals()) else target_files
-
-    if is_pattern_mode and not target_files:
-        target_files, _, _ = expand_pattern_to_target_files(null_path, alt_path, pattern_raw, output_dir, proportion=proportion_raw)
-    elif not is_pattern_mode and not target_files:
-        if len(pos) >= 2:
-            target_files = pos
-        elif len(pos) == 1:
-            target_files = [pos[0]]
-        else:
-            parser.print_help()
-            sys.exit("\nError: Must specify sequence file(s), or (alt, pattern), or (null, alt, pattern).")
+    for tf in target_files:
+        if tf and tf.name != "null":
+            ensure_sequence_simulated(tf, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves, design=args.design)
 
     # 1. Check Mapping
     tree_path = args.input_tree
@@ -733,16 +726,17 @@ def main(argv=None):
     if not node_label:
         candidates_to_check = target_files + pos
         if is_pattern_mode:
-            candidates_to_check.extend([null_path, alt_path])
+            if null_path:
+                candidates_to_check.append(null_path)
+            if alt_path:
+                candidates_to_check.append(alt_path)
 
         for cand_file in candidates_to_check:
-            extracted = extract_branch_name_from_filename(cand_file)
-            if extracted:
-                node_label = extracted
-                break
-
-    if not node_label:
-        sys.exit("Error: Internal node label could not be determined. Please specify --node.")
+            if cand_file:
+                extracted = extract_branch_name_from_filename(cand_file)
+                if extracted:
+                    node_label = extracted
+                    break
 
     exp_names = set()
     for tf in target_files:
@@ -759,8 +753,14 @@ def main(argv=None):
     if not exp_names:
         exp_names.add("default")
 
-    for exp_name in sorted(exp_names):
-        ensure_mapping(tree_path, node_label, args.mapping, exp_name=exp_name, output_dir=output_dir)
+    is_null_only = exp_names == {"null"}
+
+    if not node_label and not is_null_only:
+        sys.exit("Error: Internal node label could not be determined. Please specify --node.")
+
+    if not is_null_only:
+        for exp_name in sorted(exp_names):
+            ensure_mapping(tree_path, node_label, args.mapping, exp_name=exp_name, output_dir=output_dir)
 
     # 2. Check Sequence Simulation & 3. Check Neoaves Filter
     processed_files = []
@@ -773,15 +773,18 @@ def main(argv=None):
             processed_files.append(sim_fa)
 
     # 4. Run Concat Sequences
-    print(f"\n[4/4 Concat Sequences] Concatenating {len(processed_files)} sequence files...", file=sys.stderr)
+    print(f"\n[4/4 Concat Sequences] Concatenating sequence files...", file=sys.stderr)
     
-    # Build args for concat_main
     if is_pattern_mode:
-        concat_argv = ["-n", str(null_path), "-a", str(alt_path)]
-        if pattern_raw:
-            concat_argv.extend(["--pattern", pattern_raw])
-        if proportion_raw:
-            concat_argv.extend(["-p", str(proportion_raw)])
+        concat_argv = ["-n", str(null_path)]
+        if alt_path:
+            concat_argv.extend(["-a", str(alt_path)])
+        concat_argv.extend(["--np", args.np, "--ap", args.ap])
+
+        if coord_parts:
+            concat_argv.extend(coord_parts)
+        if args.proportion:
+            concat_argv.extend(["-p", str(args.proportion)])
     else:
         concat_argv = [str(f) for f in processed_files]
 
