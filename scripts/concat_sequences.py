@@ -112,11 +112,19 @@ def get_experiment_folder_name(path_or_stem: str | Path | None) -> str:
                 if res and res != "null":
                     return res
 
-    try:
-        from simulate import generate_new_filename
-        std_name = generate_new_filename(path_or_stem)
+    std_name = None
+    if "simulate" in sys.modules and hasattr(sys.modules["simulate"], "generate_new_filename"):
+        std_name = sys.modules["simulate"].generate_new_filename(path_or_stem)
+    else:
+        try:
+            from simulate import generate_new_filename
+            std_name = generate_new_filename(path_or_stem)
+        except Exception:
+            pass
+
+    if std_name:
         clean = strip_chunk_index(get_base_name(std_name))
-    except Exception:
+    else:
         clean = strip_chunk_index(get_base_name(path_or_stem))
 
     if clean.startswith("alt-"):
@@ -763,8 +771,8 @@ def main(argv=None):
 
             total_alt_bp = sum(length for _, length in parsed_intervals)
 
-            is_custom_np = args.np != "n1n2n3n4n5n6n7n8n9n10n11n12"
-            is_custom_ap = args.ap != "a1a2a3"
+            is_custom_np = args.np.lower() != "n1n2n3n4n5n6n7n8n9n10n11n12"
+            is_custom_ap = args.ap.lower() != "a1a2a3"
 
             if args.output is None:
                 interval_labels = []
@@ -776,12 +784,13 @@ def main(argv=None):
                 interval_str_label = ",".join(interval_labels) if interval_labels else ""
 
                 if is_custom_np or is_custom_ap:
-                    pattern_stem = build_interleaved_pattern_string(args.np, args.ap, pct_intervals)
-                    output_stem = f"{pattern_stem}_{interval_str_label}" if interval_str_label else pattern_stem
-                elif interval_str_label:
-                    output_stem = interval_str_label
+                    pattern_stem = build_interleaved_pattern_string(args.np, args.ap, pct_intervals if intervals else None)
+                    if interval_str_label:
+                        output_stem = f"{pattern_stem};{interval_str_label}"
+                    else:
+                        output_stem = pattern_stem
                 else:
-                    output_stem = exp_folder_name
+                    output_stem = interval_str_label if interval_str_label else exp_folder_name
                 output_name = f"{output_stem}.fa"
             else:
                 output_name = args.output.name

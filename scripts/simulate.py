@@ -32,7 +32,6 @@ from concat_sequences import (
     get_chunk_index,
     main as concat_main,
 )
-
 # Standard 37 Palaeognathae and Galloanserae outgroup taxa
 OUTGROUP_TAXA = {
     # Palaeognathae
@@ -142,10 +141,14 @@ def get_base_name(path: str | Path | None) -> str:
 
 KNOWN_CHANGES_MAP = {
     "recombination_increase": "recombination_up",
+    "recombination_up": "recombination_up",
     "recombination_decrease": "recombination_down",
     "recombination_suppression": "recombination_down",
+    "recombination_down": "recombination_down",
     "10x_up": "10X_up",
+    "10X_up": "10X_up",
     "10x_down": "10X_down",
+    "10X_down": "10X_down",
     "admixture": "admixture",
 }
 
@@ -174,7 +177,7 @@ def parse_filename(path_or_str: str | Path) -> dict:
         ext = Path(path_or_str).suffix
 
     is_neoaves = "neoaves" in filename.lower()
-    is_concat = filename.startswith("concat_") or ("_a" in filename and ("n" in filename or "a" in filename) and ("_n" in filename or "_a" in filename or filename.endswith("_na")))
+    is_concat = filename.startswith("concat_") or bool(re.search(r"[an]\d+[an]\d+", filename))
 
     prefix = "alt" if ("anomaly" in filename.lower() or filename.startswith("alt")) else "null"
     index = ""
@@ -220,14 +223,14 @@ def parse_filename(path_or_str: str | Path) -> dict:
         m_rec = re.search(r"recombination_(increase|decrease|suppression|up|down)[-_]([A-Za-z0-9_]+)", filename, re.IGNORECASE)
         if m_rec:
             c_raw = f"recombination_{m_rec.group(1).lower()}"
-            change = KNOWN_CHANGES_MAP.get(c_raw, "recombination_up")
+            change = KNOWN_CHANGES_MAP.get(c_raw, c_raw)
             branch = m_rec.group(2).split("-500K")[0].split("-500k")[0]
         else:
             m_rec_rev = re.search(r"([A-Za-z0-9_]+)[-_]recombination_(increase|decrease|suppression|up|down)", filename, re.IGNORECASE)
             if m_rec_rev:
                 branch = m_rec_rev.group(1)
                 c_raw = f"recombination_{m_rec_rev.group(2).lower()}"
-                change = KNOWN_CHANGES_MAP.get(c_raw, "recombination_up")
+                change = KNOWN_CHANGES_MAP.get(c_raw, c_raw)
 
     # Clean up branch name
     if branch:
@@ -678,11 +681,8 @@ def main(argv=None):
         null_path = Path("null")
 
     if not coord_parts:
-        import random
-        start_perc = random.randint(0, 75)
-        end_perc = start_perc + 25
-        coord_parts = [f"{start_perc}-{end_perc}"]
-        print(f"No interval provided. Randomly selected interval: {coord_parts[0]}", file=sys.stderr)
+        coord_parts = ["40-65"]
+        print(f"No interval provided. Defaulting to interval: {coord_parts[0]}", file=sys.stderr)
 
     interval_str = ",".join(coord_parts)
 
