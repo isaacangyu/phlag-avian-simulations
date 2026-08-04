@@ -97,20 +97,26 @@ def get_base_name(path: str | Path | None) -> str:
 def get_experiment_folder_name(path_or_stem: str | Path | None) -> str:
     """
     Extracts experiment folder name from path or stem, e.g.:
-      'alt-Nyctibiidae_10X_up-1.ts' -> 'Nyctibiidae_10X_up'
-      'anomaly_case-recombination_increase-N36-500Kb-1.ts' -> 'N36_recombination_up'
-      'null-1.ts'                  -> 'null'
+      'alt-Nyctibiidae_10X_up-1.ts' -> 'Nyctibiidae'
+      'N554_10X_up-1.ts' -> 'N554'
+      'Strigiformes_N297_admixture_rate090-time7099554-1.ts' -> 'Strigiformes_N297_rate090-time7099554'
+      'null-1.ts' -> 'null'
     """
     if not path_or_stem:
         return "default"
     
     p = Path(path_or_stem)
-    if get_base_name(p).isdigit():
+    reserved = {"ts", "simulated", "concat", "simulations", "store", ".", "..", "up", "down", "low", "high", "10x", "recombination", "admixture", "iang", "home", "drive2", "root", "none"}
+
+    bname = get_base_name(p)
+    if bname.isdigit() or bname.lower() in reserved:
         for part in reversed(p.parts[:-1]):
-            if part.lower() not in ("ts", "simulated", "concat", "simulations", "store", ".", ".."):
+            part_clean = part.strip("-_")
+            if part_clean.lower() not in reserved and not part_clean.isdigit():
                 res = get_experiment_folder_name(part)
-                if res and res != "null":
+                if res and res != "default":
                     return res
+        return "default"
 
     std_name = None
     if "simulate" in sys.modules and hasattr(sys.modules["simulate"], "generate_new_filename"):
@@ -128,30 +134,133 @@ def get_experiment_folder_name(path_or_stem: str | Path | None) -> str:
         clean = strip_chunk_index(get_base_name(path_or_stem))
 
     if clean.startswith("alt-"):
-        return clean[4:]
-    elif clean.startswith("null-"):
+        clean = clean[4:]
+    elif clean.startswith("null-") or clean == "null":
         return "null"
-    elif clean in ("null", "alt", "default"):
-        return clean
-    return clean
+
+    clean = clean.replace("anomaly_case-", "").replace("alt-", "")
+    
+    meta = {}
+    if "simulate" in sys.modules and hasattr(sys.modules["simulate"], "parse_filename"):
+        meta = sys.modules["simulate"].parse_filename(p)
+    else:
+        try:
+            from simulate import parse_filename
+            meta = parse_filename(p)
+        except Exception:
+            pass
+
+    branch = meta.get("branch")
+    change = meta.get("change")
+    rate = meta.get("rate")
+    time = meta.get("time")
+
+    if change == "admixture" and branch and rate and time:
+        rate_str = rate if rate.startswith("rate") else f"rate{rate}"
+        time_str = time if time.startswith("time") else f"time{time}"
+        return f"{branch}_{rate_str}-{time_str}"
+    elif branch and branch.lower() not in reserved and not branch.isdigit():
+        return branch
+
+    clean = clean.replace("_admixture", "").replace("admixture_", "").replace("admixture", "")
+    clean = clean.replace("_10X_up", "").replace("_10X_down", "").replace("_10x_up", "").replace("_10x_down", "")
+    clean = clean.replace("_recombination_up", "").replace("_recombination_down", "").replace("_recombination_increase", "").replace("_recombination_decrease", "")
+    clean = clean.replace("_up", "").replace("_down", "")
+    clean = clean.strip("-_")
+
+    if clean.lower() in reserved:
+        return "default"
+
+    return clean if clean else "default"
+
+
+def get_experiment_relative_path(path_or_stem: str | Path | None) -> Path:
+    """
+    Returns relative directory path under simulations/ with two levels of categories:
+      - 10X/up/<exp_name> or 10X/down/<exp_name>
+      - recombination/up/<exp_name> or recombination/down/<exp_name>
+      - admixture/low/<exp_name> (time < 4) or admixture/high/<exp_name> (time >= 4)
+      - null -> null
+    """
+    if not path_or_stem:
+        return Path("default")
+
+    p = Path(path_or_stem)
+    exp_name = get_experiment_folder_name(p)
+    if exp_name in ("null", "default"):
+        return Path(exp_name)
+
+    meta = {}
+    if "simulate" in sys.modules and hasattr(sys.modules["simulate"], "parse_filename"):
+        meta = sys.modules["simulate"].parse_filename(p)
+    else:
+        try:
+            from simulate import parse_filename
+            meta = parse_filename(p)
+        except Exception:
+            pass
+
+    change = meta.get("change") or ""
+    str_lower = str(p).lower()
+    exp_lower = exp_name.lower()
+    change_lower = change.lower()
+    time_str = meta.get("time") or ""
+
+    # 1. 10X
+    if "10x" in str_lower or "10x" in change_lower:
+        sub = "up" if ("up" in str_lower or "up" in change_lower) else "down"
+        return Path("10X") / sub / exp_name
+
+    # 2. Recombination
+    if "recombination" in str_lower or "recombination" in change_lower:
+        is_down = "suppression" in str_lower or "decrease" in str_lower or "down" in str_lower or "down" in change_lower
+        sub = "down" if is_down else "up"
+        return Path("recombination") / sub / exp_name
+
+    # 3. Admixture
+    if "admixture" in str_lower or change_lower == "admixture":
+        div_time = None
+        if time_str:
+            m_num = re.search(r"\d+", time_str)
+            if m_num:
+                div_time = float(m_num.group())
+        if div_time is None:
+            m_time = re.search(r"time[-_]?(\d+)", str_lower)
+            if m_time:
+                div_time = float(m_time.group(1))
+
+        if div_time is not None:
+            if div_time > 1000:
+                div_time = div_time / 1000000.0
+            sub = "low" if div_time < 4.0 else "high"
+        else:
+            sub = "low"
+        return Path("admixture") / sub / exp_name
+
+    return Path(exp_name)
 
 
 def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
     bname = get_base_name(f)
     exp_name = get_experiment_folder_name(f)
+    exp_rel = get_experiment_relative_path(f)
 
-    # Standard candidate paths
+    # Standard candidate paths (checking 2-level path first, then legacy flat path)
     fasta_candidates = [
         f if f.suffix in (".fa", ".fasta") else f.with_suffix(".fa"),
+        output_dir / exp_rel / "simulated" / f"{bname}.fa",
         output_dir / exp_name / "simulated" / f"{bname}.fa",
     ]
     
     chunk_idx = get_chunk_index(bname)
     if chunk_idx:
-        fasta_candidates.insert(1, output_dir / exp_name / "simulated" / f"{chunk_idx}.fa")
+        fasta_candidates.insert(1, output_dir / exp_rel / "simulated" / f"{chunk_idx}.fa")
+        fasta_candidates.insert(2, output_dir / exp_name / "simulated" / f"{chunk_idx}.fa")
 
     fasta_candidates.extend([
+        output_dir / exp_rel / "concat" / f"{bname}.fa",
         output_dir / exp_name / "concat" / f"{bname}.fa",
+        output_dir / exp_rel / f"{bname}.fa",
         output_dir / exp_name / f"{bname}.fa",
         output_dir / "simulated" / f"{bname}.fa",
         f.parent / f"{bname}.fa",
@@ -258,12 +367,16 @@ def strip_chunk_index(stem: str) -> str:
 
 
 def get_chunk_index(stem: str) -> str:
-    """Extracts numeric chunk index from base name (e.g., '5' from null-5 or 'a2' or legacy default-500Kb-5)."""
-    m = re.search(r"-(\d+)(?:-[^/]+)?$", stem)
+    """Extracts numeric chunk index (1-12) from base name (e.g., '1' from '...-500Kb-1' or 'null-5' or '1.ts')."""
+    s = Path(stem).stem if ("/" in stem or "\\" in stem or stem.endswith(".ts") or stem.endswith(".fa")) else stem
+    # 1. Matches explicit trailing chunk index after dash (e.g. -1, -2, -500Kb-1)
+    m = re.search(r"-(\d{1,2})$", s)
     if not m:
-        m = re.search(r"-(\d+)-", stem)
+        # 2. Matches index before extension or after 500Kb
+        m = re.search(r"(?:-500[Kk][Bb]|-null|-alt|-default)-(\d{1,2})$", s)
     if not m:
-        m = re.search(r"(\d+)", stem)
+        # 3. Matches standalone single/double digit index (e.g., "1", "2", "3")
+        m = re.fullmatch(r"(\d{1,2})", s)
     return m.group(1) if m else ""
 
 
@@ -306,7 +419,12 @@ def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list
     exp_name = get_experiment_folder_name(base_path)
     found_indices = set()
 
+    exp_rel = get_experiment_relative_path(base_path)
     search_dirs = [
+        output_dir / exp_rel / "ts",
+        output_dir / exp_rel / "simulated",
+        output_dir / exp_rel / "concat",
+        output_dir / exp_rel,
         output_dir / exp_name / "ts",
         output_dir / exp_name / "simulated",
         output_dir / exp_name / "concat",
@@ -746,8 +864,9 @@ def main(argv=None):
                         alt_fastas[header] = ""
                     alt_fastas[header] += chunk_data.get(header, "")
 
-        exp_folder_name = get_experiment_folder_name(alt_path) if alt_path and str(alt_path).lower() != "null" else "null"
-        exp_dir = output_dir / exp_folder_name
+        exp_rel_path = get_experiment_relative_path(alt_path if alt_path and str(alt_path).lower() != "null" else null_path)
+        exp_folder_name = exp_rel_path.name
+        exp_dir = output_dir / exp_rel_path
         concat_dir = exp_dir / "concat"
         concat_dir.mkdir(parents=True, exist_ok=True)
 
@@ -795,6 +914,10 @@ def main(argv=None):
             else:
                 output_name = args.output.name
             output_path = concat_dir / output_name
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
+                return
 
             print(f"Applying {len(intervals)} interval insertions (total length: {total_alt_bp} bp) to {args.np} block...", file=sys.stderr)
             with open(output_path, "w") as f:
@@ -846,6 +969,10 @@ def main(argv=None):
             else:
                 output_name = args.output.name
             output_path = concat_dir / output_name
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
+                return
             
             with open(output_path, "w") as f:
                 for header in base_headers:
@@ -889,8 +1016,9 @@ def main(argv=None):
         first_alt = next((rf for rf, ft in zip(resolved_files, file_types) if ft == "a"), None)
         first_null = next((rf for rf, ft in zip(resolved_files, file_types) if ft == "n"), None)
 
-        exp_folder_name = get_experiment_folder_name(first_alt if first_alt else first_null)
-        exp_dir = output_dir / exp_folder_name
+        exp_rel_path = get_experiment_relative_path(first_alt if first_alt else first_null)
+        exp_folder_name = exp_rel_path.name
+        exp_dir = output_dir / exp_rel_path
         concat_dir = exp_dir / "concat"
         concat_dir.mkdir(parents=True, exist_ok=True)
 
@@ -901,6 +1029,10 @@ def main(argv=None):
             output_path = concat_dir / args.output.name
         else:
             output_path = args.output
+
+        if output_path.exists() and output_path.stat().st_size > 0:
+            print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
+            return
 
         print(f"Concatenating 12 sequence files (6Mbp total)...", file=sys.stderr)
         with open(output_path, "w") as f:
