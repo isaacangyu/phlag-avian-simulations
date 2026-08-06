@@ -44,24 +44,6 @@ def get_output_dir() -> Path:
     return get_connection_dir() / "simulations"
 
 
-def get_phlag_dir() -> Path:
-    val = os.environ.get("PHLAG_DIR")
-    if not val:
-        env_vars = load_env_vars()
-        val = env_vars.get("PHLAG_DIR")
-    if val:
-        p = Path(val).expanduser().resolve()
-        if p.exists():
-            return p
-    cand = (Path(__file__).resolve().parent.parent / "phlag").resolve()
-    if cand.exists():
-        return cand
-    cand_home = (Path.home() / "phlag").resolve()
-    if cand_home.exists():
-        return cand_home
-    sys.exit("Error: PHLAG_DIR environment variable is not set or phlag directory does not exist. Please clone the phlag repository.")
-
-
 def read_fasta(filepath: Path) -> dict[str, str]:
     sequences = {}
     current_header = None
@@ -179,8 +161,11 @@ def get_experiment_relative_path(path_or_stem: str | Path | None) -> Path:
     Returns relative directory path under simulations/ with two levels of categories:
       - 10X/up/<exp_name> or 10X/down/<exp_name>
       - recombination/up/<exp_name> or recombination/down/<exp_name>
-      - admixture/low/<exp_name> (time < 4) or admixture/high/<exp_name> (time >= 4)
+      - admixture/low/<exp_name> (time <= 4,000,000) or admixture/high/<exp_name> (time > 4,000,000)
       - null -> null
+    Classification comes solely from parse_filename()'s `change`/`time` fields (never from a raw
+    substring search over the path string), and there is no flat fallback: an experiment whose
+    category can't be determined is an error, not a guess.
     """
     if not path_or_stem:
         return Path("default")
@@ -200,112 +185,40 @@ def get_experiment_relative_path(path_or_stem: str | Path | None) -> Path:
         except Exception:
             pass
 
-    change = meta.get("change") or ""
-    str_lower = str(p).lower()
-    exp_lower = exp_name.lower()
-    change_lower = change.lower()
-    time_str = meta.get("time") or ""
+    change = (meta.get("change") or "").strip()
 
-    # 1. 10X
-    if "10x" in str_lower or "10x" in change_lower:
-        sub = "up" if ("up" in str_lower or "up" in change_lower) else "down"
+    if change in ("10X_up", "10X_down"):
+        sub = "up" if change == "10X_up" else "down"
         return Path("10X") / sub / exp_name
 
-    # 2. Recombination
-    if "recombination" in str_lower or "recombination" in change_lower:
-        is_down = "suppression" in str_lower or "decrease" in str_lower or "down" in str_lower or "down" in change_lower
-        sub = "down" if is_down else "up"
+    if change in ("recombination_up", "recombination_down"):
+        sub = "up" if change == "recombination_up" else "down"
         return Path("recombination") / sub / exp_name
 
-    # 3. Admixture
-    if "admixture" in str_lower or change_lower == "admixture":
-        div_time = None
-        if time_str:
-            m_num = re.search(r"\d+", time_str)
-            if m_num:
-                div_time = float(m_num.group())
-        if div_time is None:
-            m_time = re.search(r"time[-_]?(\d+)", str_lower)
-            if m_time:
-                div_time = float(m_time.group(1))
-
-        if div_time is not None:
-            if div_time > 1000:
-                div_time = div_time / 1000000.0
-            sub = "low" if div_time < 4.0 else "high"
-        else:
-            sub = "low"
+    if change == "admixture":
+        time_str = meta.get("time") or ""
+        m_num = re.search(r"\d+", time_str)
+        if not m_num:
+            sys.exit(f"Error: Could not determine admixture divergence time for '{path_or_stem}' - cannot classify as low/high.")
+        div_time = float(m_num.group())
+        sub = "high" if div_time > 4_000_000 else "low"
         return Path("admixture") / sub / exp_name
 
-    return Path(exp_name)
+    sys.exit(f"Error: Could not determine experiment category (10X/recombination/admixture) for '{path_or_stem}' (change={change!r}).")
 
 
 def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
+    """Returns the single deterministic simulated FASTA path for a base name/chunk, erroring if missing."""
     bname = get_base_name(f)
-    exp_name = get_experiment_folder_name(f)
     exp_rel = get_experiment_relative_path(f)
-
-    # Standard candidate paths (checking 2-level path first, then legacy flat path)
-    fasta_candidates = [
-        f if f.suffix in (".fa", ".fasta") else f.with_suffix(".fa"),
-        output_dir / exp_rel / "simulated" / f"{bname}.fa",
-        output_dir / exp_name / "simulated" / f"{bname}.fa",
-    ]
-    
     chunk_idx = get_chunk_index(bname)
-    if chunk_idx:
-        fasta_candidates.insert(1, output_dir / exp_rel / "simulated" / f"{chunk_idx}.fa")
-        fasta_candidates.insert(2, output_dir / exp_name / "simulated" / f"{chunk_idx}.fa")
+    name = f"{chunk_idx}.fa" if chunk_idx else f"{bname}.fa"
 
-    fasta_candidates.extend([
-        output_dir / exp_rel / "concat" / f"{bname}.fa",
-        output_dir / exp_name / "concat" / f"{bname}.fa",
-        output_dir / exp_rel / f"{bname}.fa",
-        output_dir / exp_name / f"{bname}.fa",
-        output_dir / "simulated" / f"{bname}.fa",
-        f.parent / f"{bname}.fa",
-    ])
+    candidate = output_dir / exp_rel / "simulated" / name
+    if candidate.exists() and candidate.is_file():
+        return candidate
 
-    for candidate in fasta_candidates:
-        if candidate.exists() and candidate.is_file():
-            return candidate
-
-    sys.exit(f"Error: Sequence FASTA file does not exist for base name: '{bname}' ({f})")
-
-
-def ensure_null_12mb_block(output_dir: Path) -> Path:
-    """
-    Creates/retrieves a 12Mbps (12 x 500Kb chunks) null concatenated block saved in output_dir/null/n1n2n3n4n5n6n7n8n9n10n11n12.fa.
-    """
-    null_dir = output_dir / "null" / "concat"
-    null_dir.mkdir(parents=True, exist_ok=True)
-    null_12mb_path = null_dir / "n1n2n3n4n5n6n7n8n9n10n11n12.fa"
-    legacy_path = output_dir / "null" / "null_12mb.fa"
-
-    if null_12mb_path.exists():
-        return null_12mb_path
-    if legacy_path.exists():
-        return legacy_path
-
-    # Concatenate null chunks 1..12
-    null_chunk_files = [resolve_fasta_file(Path(f"null-{i}"), output_dir) for i in range(1, 13)]
-    fastas = [read_fasta(f) for f in null_chunk_files]
-
-    base_headers = list(fastas[0].keys())
-    for idx, fa in enumerate(fastas[1:], start=2):
-        missing = set(base_headers) - set(fa.keys())
-        extra = set(fa.keys()) - set(base_headers)
-        if missing or extra:
-            sys.exit(f"Error: Header mismatch in null chunk #{idx} ({null_chunk_files[idx-1]}): missing={missing}, extra={extra}")
-
-    print(f"Creating 12Mbps null block -> {null_12mb_path}...", file=sys.stderr)
-    with open(null_12mb_path, "w") as f:
-        for header in base_headers:
-            f.write(f">{header}\n")
-            seq_concat = "".join(fa[header] for fa in fastas)
-            f.write(f"{seq_concat}\n")
-
-    return null_12mb_path
+    sys.exit(f"Error: Sequence FASTA file does not exist: {candidate}")
 
 
 def mix_sequences(null_seq: str, alt_seq: str, pattern: str) -> str:
@@ -412,62 +325,23 @@ def construct_indexed_path(base_name: str | Path, idx_str: str) -> Path:
 
 def find_existing_chunk_indices(base_path: str | Path, output_dir: Path) -> list[int]:
     """
-    Finds all existing numeric chunk indices for a base name across ts, simulated, concat, and local directories.
-    Returns a sorted list of unique integer chunk indices.
+    Finds existing numeric chunk indices for a base name under its single deterministic
+    experiment directory (ts/, simulated/, concat/) - no legacy-layout, CWD, or external
+    directory scanning.
     """
-    clean_base = strip_chunk_index(get_base_name(base_path)).lower()
-    exp_name = get_experiment_folder_name(base_path)
+    exp_rel = get_experiment_relative_path(base_path)
     found_indices = set()
 
-    exp_rel = get_experiment_relative_path(base_path)
-    search_dirs = [
-        output_dir / exp_rel / "ts",
-        output_dir / exp_rel / "simulated",
-        output_dir / exp_rel / "concat",
-        output_dir / exp_rel,
-        output_dir / exp_name / "ts",
-        output_dir / exp_name / "simulated",
-        output_dir / exp_name / "concat",
-        output_dir / exp_name,
-        output_dir / "ts",
-        Path(base_path).parent if Path(base_path).parent.exists() else Path("."),
-        Path("."),
-    ]
-    
-    phlag_dir = get_phlag_dir()
-    search_dirs.append(phlag_dir / "ts")
-
-    for sdir in search_dirs:
-        if not sdir.exists() or not sdir.is_dir():
+    for subdir in ("ts", "simulated", "concat"):
+        sdir = output_dir / exp_rel / subdir
+        if not sdir.is_dir():
             continue
-        try:
-            for p in sdir.iterdir():
-                p_bname = get_base_name(p).lower()
-                # If searching for null, match null- or default-
-                matches_base = False
-                if sdir.name in ("ts", "simulated", "concat") and sdir.parent.name.lower() == exp_name.lower():
-                    matches_base = True
-                elif sdir.name.lower() == exp_name.lower():
-                    matches_base = True
-                elif clean_base in ("null", "default") or clean_base.startswith("null") or clean_base.startswith("default"):
-                    matches_base = p_bname.startswith("null") or p_bname.startswith("default")
-                else:
-                    p_clean = strip_chunk_index(p_bname)
-                    matches_base = (clean_base in p_bname) or (clean_base in p_clean)
+        for p in sdir.iterdir():
+            stem = get_base_name(p)
+            if stem.isdigit():
+                found_indices.add(int(stem))
 
-                if matches_base:
-                    if p_bname.isdigit():
-                        found_indices.add(int(p_bname))
-                    else:
-                        m = re.search(r"-(\d+)(?:-[^/]+)?$", p_bname)
-                        if not m:
-                            m = re.search(r"-(\d+)-", p_bname)
-                        if m:
-                            found_indices.add(int(m.group(1)))
-        except Exception:
-            pass
-
-    return sorted(list(found_indices))
+    return sorted(found_indices)
 
 
 import random
@@ -597,6 +471,24 @@ def parse_interval_pattern(pattern_raw: str) -> list[tuple[int, int]] | None:
             return None
 
     return intervals if intervals else None
+
+
+def interval_label(interval_str: str) -> str:
+    """
+    Computes the auto-generated concat filename stem for a given interval string, using the
+    exact same parsing/formatting `concatenate_pair` uses when np/ap are left at their defaults.
+    Single source of truth so callers (e.g. a structure audit) can never drift from what
+    `concatenate_pair` actually names its output file.
+    """
+    intervals = parse_interval_pattern(interval_str)
+    if not intervals:
+        sys.exit(f"Error: Invalid interval string: {interval_str}")
+    labels = []
+    for st_v, end_v in intervals:
+        st_s = f"{int(st_v)}" if int(st_v) == st_v else f"{st_v}"
+        end_s = f"{int(end_v)}" if int(end_v) == end_v else f"{end_v}"
+        labels.append(f"{st_s}-{end_s}")
+    return ",".join(labels)
 
 
 def format_prop_decimal(prop_val: float) -> str:
@@ -754,6 +646,172 @@ def expand_pattern_to_target_files(
     return target_files, suffix_label, prop_val
 
 
+def concatenate_pair(
+    null_path: Path | None,
+    alt_path: Path | None,
+    output_dir: Path,
+    np_pattern: str = "n1n2n3n4n5n6n7n8n9n10n11n12",
+    ap_pattern: str = "a1a2a3",
+    proportion: str | float | None = None,
+    interval: str | None = None,
+) -> Path:
+    """
+    Concatenates a null sequence with an optional alt sequence into a 6Mbp FASTA, written to
+    output_dir/<exp_rel>/concat/<auto-generated-name>.fa. Called directly (no argv/CLI
+    round-trip) by both this module's own `main()` and by `simulate.py`.
+    """
+    intervals = parse_interval_pattern(interval) if interval else None
+
+    # 1. Load the null base sequence
+    if null_path and str(null_path).lower() != "null":
+        base_null_fa = resolve_fasta_file(null_path, output_dir)
+        null_fastas = read_fasta(base_null_fa)
+    else:
+        matches = re.findall(r'[an](\d+)', np_pattern.lower())
+        null_chunk_indices = [int(m) for m in matches] if matches else [i for i in range(1, 13)]
+
+        null_fastas = {}
+        for idx in null_chunk_indices:
+            cf = output_dir / "null" / "simulated" / f"{idx}.fa"
+            if not cf.exists():
+                sys.exit(f"Error: Null chunk FASTA does not exist: {cf}")
+            rf = read_fasta(cf)
+            for header, seq in rf.items():
+                null_fastas.setdefault(header, "")
+                null_fastas[header] += seq
+
+    base_headers = list(null_fastas.keys())
+
+    # 2. Load the alt chunks
+    alt_fastas = {}
+    if alt_path and str(alt_path).lower() != "null":
+        matches = re.findall(r'[an](\d+)', ap_pattern.lower())
+        alt_chunk_indices = [int(m) for m in matches] if matches else [1, 2, 3]
+
+        for idx in alt_chunk_indices:
+            cf = construct_indexed_path(alt_path, str(idx))
+            rf = resolve_fasta_file(cf, output_dir)
+            chunk_data = read_fasta(rf)
+            for header in base_headers:
+                alt_fastas.setdefault(header, "")
+                alt_fastas[header] += chunk_data.get(header, "")
+
+    exp_rel_path = get_experiment_relative_path(alt_path if alt_path and str(alt_path).lower() != "null" else null_path)
+    exp_folder_name = exp_rel_path.name
+    exp_dir = output_dir / exp_rel_path
+    concat_dir = exp_dir / "concat"
+    concat_dir.mkdir(parents=True, exist_ok=True)
+
+    if intervals:
+        total_null_bp = sum(len(seq) for seq in null_fastas.values()) // len(base_headers) if base_headers else 6000000
+
+        parsed_intervals = []
+        pct_intervals = []
+        for start_val, end_val in intervals:
+            if end_val <= 100:
+                st = int((start_val / 100.0) * total_null_bp)
+                length = int(((end_val - start_val) / 100.0) * total_null_bp)
+                pct_intervals.append((float(start_val), float(end_val)))
+            else:
+                st = start_val
+                length = end_val - start_val
+                pct_st = (start_val / float(total_null_bp)) * 100.0
+                pct_end = (end_val / float(total_null_bp)) * 100.0
+                pct_intervals.append((pct_st, pct_end))
+            parsed_intervals.append((st, length))
+
+        total_alt_bp = sum(length for _, length in parsed_intervals)
+
+        is_custom_np = np_pattern.lower() != "n1n2n3n4n5n6n7n8n9n10n11n12"
+        is_custom_ap = ap_pattern.lower() != "a1a2a3"
+
+        interval_str_label = interval_label(interval)
+
+        if is_custom_np or is_custom_ap:
+            pattern_stem = build_interleaved_pattern_string(np_pattern, ap_pattern, pct_intervals if intervals else None)
+            output_stem = f"{pattern_stem};{interval_str_label}" if interval_str_label else pattern_stem
+        else:
+            output_stem = interval_str_label if interval_str_label else exp_folder_name
+        output_path = concat_dir / f"{output_stem}.fa"
+
+        if output_path.exists() and output_path.stat().st_size > 0:
+            print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
+            return output_path
+
+        print(f"Applying {len(intervals)} interval insertions (total length: {total_alt_bp} bp) to {np_pattern} block...", file=sys.stderr)
+        with open(output_path, "w") as f:
+            for header in base_headers:
+                f.write(f">{header}\n")
+                null_seq = null_fastas[header]
+                alt_seq = alt_fastas.get(header, null_seq)
+
+                alt_sub = alt_seq[:total_alt_bp] if len(alt_seq) >= total_alt_bp else (alt_seq * (total_alt_bp // max(1, len(alt_seq)) + 1))[:total_alt_bp]
+                trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
+
+                final_seq = []
+                null_idx = 0
+                alt_idx = 0
+
+                sorted_intervals = sorted(parsed_intervals, key=lambda x: x[0])
+                curr_pos = 0
+
+                for st, length in sorted_intervals:
+                    null_len = st - curr_pos
+                    if null_len > 0:
+                        final_seq.append(null_seq[null_idx:null_idx + null_len])
+                        null_idx += null_len
+                        curr_pos += null_len
+
+                    alt_chunk = alt_sub[alt_idx:alt_idx + length]
+                    final_seq.append(alt_chunk)
+                    alt_idx += length
+                    curr_pos += length
+
+                remaining_null_len = trimmed_null_length - null_idx
+                if remaining_null_len > 0:
+                    final_seq.append(null_seq[null_idx:null_idx + remaining_null_len])
+
+                f.write(f"{''.join(final_seq)}\n")
+
+        print(f"Writing output FASTA: {output_path}", file=sys.stderr)
+        print("Done.", file=sys.stderr)
+        return output_path
+
+    is_pure_null = (not alt_path or str(alt_path).lower() == "null")
+    np_str = "" if np_pattern == "n1n2n3n4n5n6n7n8n9n10n11n12" else np_pattern
+    ap_str = "" if ap_pattern == "a1a2a3" else ap_pattern
+
+    parts = [np_str] if is_pure_null else [np_str, ap_str]
+    parts = [p for p in parts if p]
+    output_name = f"{'_'.join(parts)}.fa" if parts else f"{exp_folder_name}.fa"
+    output_path = concat_dir / output_name
+
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
+        return output_path
+
+    with open(output_path, "w") as f:
+        for header in base_headers:
+            f.write(f">{header}\n")
+            if is_pure_null:
+                f.write(f"{null_fastas[header]}\n")
+            else:
+                null_seq = null_fastas[header]
+                alt_seq = alt_fastas.get(header, "")
+
+                total_alt_bp = len(alt_seq)
+                trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
+                base_seq = list(null_seq[:trimmed_null_length])
+
+                # Default insertion: prefix alt sequence
+                base_seq[0:0] = list(alt_seq)
+
+                f.write(f"{''.join(base_seq[:len(null_seq)])}\n")
+    print(f"Writing base FASTA: {output_path}", file=sys.stderr)
+    print("Done.", file=sys.stderr)
+    return output_path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Concatenate FASTA (or TS) sequences into a 6Mbp sequence (12 chunks) using pattern or random alternative insertion."
@@ -789,7 +847,6 @@ def main(argv=None):
     parser.add_argument(
         "--ap", "--alt-pattern", type=str, default="a1a2a3", help="Alternative pattern string specifying alt chunk order."
     )
-    parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
 
     args = parser.parse_args(argv)
 
@@ -809,7 +866,7 @@ def main(argv=None):
             intervals_raw.append(p.name)
         else:
             file_pos.append(p)
-    
+
     args.interval = ",".join(intervals_raw) if intervals_raw else None
 
     if null_path or alt_path or args.interval or len(file_pos) <= 3:
@@ -818,182 +875,16 @@ def main(argv=None):
             null_path = file_pos[0]
         if len(file_pos) > 1 and not alt_path:
             alt_path = file_pos[1]
-        
+
         if null_path is None:
             null_path = Path("null")
 
     if is_pair_mode:
-        intervals = parse_interval_pattern(args.interval) if args.interval else None
-        
-        # 1. Load the null base sequence
-        if null_path and str(null_path).lower() != "null":
-            base_null_fa = resolve_fasta_file(null_path, output_dir)
-            null_fastas = read_fasta(base_null_fa)
-        else:
-            matches = re.findall(r'[an](\d+)', args.np.lower())
-            null_chunk_indices = [int(m) for m in matches] if matches else [i for i in range(1, 13)]
-            
-            null_fastas = {}
-            for idx in null_chunk_indices:
-                cf = output_dir / "null" / "simulated" / f"{idx}.fa"
-                if not cf.exists():
-                    cf = ensure_null_12mb_block(output_dir)
-                    null_fastas = read_fasta(cf)
-                    break
-                else:
-                    rf = read_fasta(cf)
-                    for header, seq in rf.items():
-                        if header not in null_fastas:
-                            null_fastas[header] = ""
-                        null_fastas[header] += seq
-
-        base_headers = list(null_fastas.keys())
-
-        # 2. Load the alt chunks
-        alt_fastas = {}
-        if alt_path and str(alt_path).lower() != "null":
-            matches = re.findall(r'[an](\d+)', args.ap.lower())
-            alt_chunk_indices = [int(m) for m in matches] if matches else [1, 2, 3]
-            
-            for idx in alt_chunk_indices:
-                cf = construct_indexed_path(alt_path, str(idx))
-                rf = resolve_fasta_file(cf, output_dir)
-                chunk_data = read_fasta(rf)
-                for header in base_headers:
-                    if header not in alt_fastas:
-                        alt_fastas[header] = ""
-                    alt_fastas[header] += chunk_data.get(header, "")
-
-        exp_rel_path = get_experiment_relative_path(alt_path if alt_path and str(alt_path).lower() != "null" else null_path)
-        exp_folder_name = exp_rel_path.name
-        exp_dir = output_dir / exp_rel_path
-        concat_dir = exp_dir / "concat"
-        concat_dir.mkdir(parents=True, exist_ok=True)
-
-        if intervals:
-            total_null_bp = sum(len(seq) for seq in null_fastas.values()) // len(base_headers) if base_headers else 6000000
-            
-            parsed_intervals = []
-            pct_intervals = []
-            for start_val, end_val in intervals:
-                if end_val <= 100:
-                    st = int((start_val / 100.0) * total_null_bp)
-                    length = int(((end_val - start_val) / 100.0) * total_null_bp)
-                    pct_intervals.append((float(start_val), float(end_val)))
-                else:
-                    st = start_val
-                    length = end_val - start_val
-                    pct_st = (start_val / float(total_null_bp)) * 100.0
-                    pct_end = (end_val / float(total_null_bp)) * 100.0
-                    pct_intervals.append((pct_st, pct_end))
-                parsed_intervals.append((st, length))
-
-            total_alt_bp = sum(length for _, length in parsed_intervals)
-
-            is_custom_np = args.np.lower() != "n1n2n3n4n5n6n7n8n9n10n11n12"
-            is_custom_ap = args.ap.lower() != "a1a2a3"
-
-            if args.output is None:
-                interval_labels = []
-                if intervals:
-                    for st_v, end_v in intervals:
-                        st_s = f"{int(st_v)}" if int(st_v) == st_v else f"{st_v}"
-                        end_s = f"{int(end_v)}" if int(end_v) == end_v else f"{end_v}"
-                        interval_labels.append(f"{st_s}-{end_s}")
-                interval_str_label = ",".join(interval_labels) if interval_labels else ""
-
-                if is_custom_np or is_custom_ap:
-                    pattern_stem = build_interleaved_pattern_string(args.np, args.ap, pct_intervals if intervals else None)
-                    if interval_str_label:
-                        output_stem = f"{pattern_stem};{interval_str_label}"
-                    else:
-                        output_stem = pattern_stem
-                else:
-                    output_stem = interval_str_label if interval_str_label else exp_folder_name
-                output_name = f"{output_stem}.fa"
-            else:
-                output_name = args.output.name
-            output_path = concat_dir / output_name
-
-            if output_path.exists() and output_path.stat().st_size > 0:
-                print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
-                return
-
-            print(f"Applying {len(intervals)} interval insertions (total length: {total_alt_bp} bp) to {args.np} block...", file=sys.stderr)
-            with open(output_path, "w") as f:
-                for header in base_headers:
-                    f.write(f">{header}\n")
-                    null_seq = null_fastas[header]
-                    alt_seq = alt_fastas.get(header, null_seq)
-                    
-                    alt_sub = alt_seq[:total_alt_bp] if len(alt_seq) >= total_alt_bp else (alt_seq * (total_alt_bp // max(1, len(alt_seq)) + 1))[:total_alt_bp]
-                    trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
-
-                    final_seq = []
-                    null_idx = 0
-                    alt_idx = 0
-                    
-                    sorted_intervals = sorted(parsed_intervals, key=lambda x: x[0])
-                    curr_pos = 0
-                    
-                    for st, length in sorted_intervals:
-                        null_len = st - curr_pos
-                        if null_len > 0:
-                            final_seq.append(null_seq[null_idx:null_idx + null_len])
-                            null_idx += null_len
-                            curr_pos += null_len
-                        
-                        alt_chunk = alt_sub[alt_idx:alt_idx + length]
-                        final_seq.append(alt_chunk)
-                        alt_idx += length
-                        curr_pos += length
-                    
-                    remaining_null_len = trimmed_null_length - null_idx
-                    if remaining_null_len > 0:
-                        final_seq.append(null_seq[null_idx:null_idx + remaining_null_len])
-
-                    f.write(f"{''.join(final_seq)}\n")
-
-            print(f"Writing output FASTA: {output_path}", file=sys.stderr)
-            print("Done.", file=sys.stderr)
-            return
-        else:
-            is_pure_null = (not alt_path or str(alt_path).lower() == "null")
-            np_str = "" if args.np == "n1n2n3n4n5n6n7n8n9n10n11n12" else args.np
-            ap_str = "" if args.ap == "a1a2a3" else args.ap
-
-            if args.output is None:
-                parts = [np_str] if is_pure_null else [np_str, ap_str]
-                parts = [p for p in parts if p]
-                output_name = f"{'_'.join(parts)}.fa" if parts else f"{exp_folder_name}.fa"
-            else:
-                output_name = args.output.name
-            output_path = concat_dir / output_name
-
-            if output_path.exists() and output_path.stat().st_size > 0:
-                print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
-                return
-            
-            with open(output_path, "w") as f:
-                for header in base_headers:
-                    f.write(f">{header}\n")
-                    if is_pure_null:
-                        f.write(f"{null_fastas[header]}\n")
-                    else:
-                        null_seq = null_fastas[header]
-                        alt_seq = alt_fastas.get(header, "")
-                        
-                        total_alt_bp = len(alt_seq)
-                        trimmed_null_length = max(0, len(null_seq) - total_alt_bp)
-                        base_seq = list(null_seq[:trimmed_null_length])
-                        
-                        # Default insertion: prefix alt sequence
-                        base_seq[0:0] = list(alt_seq)
-                        
-                        f.write(f"{''.join(base_seq[:len(null_seq)])}\n")
-            print(f"Writing base FASTA: {output_path}", file=sys.stderr)
-            print("Done.", file=sys.stderr)
-            return
+        return concatenate_pair(
+            null_path, alt_path, output_dir,
+            np_pattern=args.np, ap_pattern=args.ap,
+            proportion=args.proportion, interval=args.interval,
+        )
 
     elif len(pos) == 12:
         # Sequential concatenation of 12 explicit files
@@ -1022,17 +913,12 @@ def main(argv=None):
         concat_dir = exp_dir / "concat"
         concat_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.output is None:
-            output_name = f"{pattern_str}.fa" if pattern_str else f"{exp_folder_name}.fa"
-            output_path = concat_dir / output_name
-        elif not args.output.is_absolute():
-            output_path = concat_dir / args.output.name
-        else:
-            output_path = args.output
+        output_name = f"{pattern_str}.fa" if pattern_str else f"{exp_folder_name}.fa"
+        output_path = concat_dir / output_name
 
         if output_path.exists() and output_path.stat().st_size > 0:
             print(f"[Concat Sequences] Concatenated FASTA already exists: {output_path}", file=sys.stderr)
-            return
+            return output_path
 
         print(f"Concatenating 12 sequence files (6Mbp total)...", file=sys.stderr)
         with open(output_path, "w") as f:
@@ -1044,6 +930,8 @@ def main(argv=None):
         print(f"Writing output FASTA: {output_path}", file=sys.stderr)
 
         print("Done.", file=sys.stderr)
+
+        return output_path
 
     else:
         parser.print_help()

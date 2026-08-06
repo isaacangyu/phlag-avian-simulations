@@ -40,23 +40,6 @@ def get_output_dir() -> Path:
     return get_connection_dir() / "simulations"
 
 
-def get_phlag_dir() -> Path:
-    val = os.environ.get("PHLAG_DIR")
-    if not val:
-        env_vars = load_env_vars()
-        val = env_vars.get("PHLAG_DIR")
-    if val:
-        p = Path(val).expanduser().resolve()
-        if p.exists():
-            return p
-    cand = (Path(__file__).resolve().parent.parent / "phlag").resolve()
-    if cand.exists():
-        return cand
-    cand_home = (Path.home() / "phlag").resolve()
-    if cand_home.exists():
-        return cand_home
-    sys.exit("Error: PHLAG_DIR environment variable is not set or phlag directory does not exist. Please clone the phlag repository.")
-
 import tskit
 import msprime
 import dendropy

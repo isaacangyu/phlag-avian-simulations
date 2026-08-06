@@ -15,63 +15,6 @@ if str(SCRIPTS_DIR) not in sys.path:
 from concat_sequences import get_experiment_folder_name, get_experiment_relative_path, get_chunk_index
 from simulate import generate_new_filename
 
-def migrate_existing_experiments(sim_dir: Path):
-    """Migrates experiment directories into the 2-level directory structure (10X/up, 10X/down, etc.)."""
-    if not sim_dir.exists():
-        return
-
-    reserved_names = {"10X", "recombination", "admixture", "null", "default", "ts", "simulated", "concat", "store", ".", "..", "ape", "up", "down", "low", "high", "iang", "home", "drive2", "root", "none"}
-
-    exp_folders = []
-    for p in list(sim_dir.rglob("*")):
-        if p.is_dir() and p.name not in reserved_names:
-            if any((p / sub).exists() for sub in ("ts", "simulated", "concat")) or any(p.glob("*mapping*.tsv")):
-                exp_folders.append(p)
-
-    for item in exp_folders:
-        if not item.exists():
-            continue
-        exp_rel = get_experiment_relative_path(item)
-        if not exp_rel or exp_rel in (Path("default"), Path("."), Path("null")) or str(exp_rel).startswith("/"):
-            continue
-        target_dir = sim_dir / exp_rel
-        if item.resolve() == target_dir.resolve():
-            continue
-
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[Migrate] Moving experiment folder {item.relative_to(sim_dir)} -> {exp_rel}", file=sys.stderr)
-        if target_dir.exists():
-            for child in list(item.iterdir()):
-                dest = target_dir / child.name
-                if not dest.exists():
-                    child.rename(dest)
-            try:
-                item.rmdir()
-            except Exception:
-                pass
-        else:
-            try:
-                item.rename(target_dir)
-            except Exception:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                for child in list(item.iterdir()):
-                    dest = target_dir / child.name
-                    if not dest.exists():
-                        child.rename(dest)
-                try:
-                    item.rmdir()
-                except Exception:
-                    pass
-
-    for legacy_name in ("10X_up", "10X_down", "recombination_up", "recombination_down"):
-        for p in list(sim_dir.rglob(legacy_name)):
-            if p.is_dir():
-                try:
-                    p.rmdir()
-                except Exception:
-                    pass
-
-
 def organize_loose_ts_files(sim_dir: Path) -> list[Path]:
     if not sim_dir.exists():
         return []

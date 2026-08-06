@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Simulate command pipeline:
-1. Checks if mapping is generated (generates via internal generate_mapping if missing).
-2. Checks if tree sequences (.ts) are simulated to FASTA (simulates via simulate_sequences if missing).
-3. Checks if FASTA sequences are filtered for Neoaves (filters outgroup taxa via internal filter_neoaves if missing).
-4. Runs sequence concatenation via concat_sequences.
+Simulate command pipeline. Four modes, selected by exactly one positional target:
+  (no target)      Ensures every already-organized node experiment directory (10X/recombination/
+                    admixture; null is skipped) is complete: renames any non-numerically-named
+                    .ts files, simulates/filters every chunk, ensures mapping, and runs the
+                    default six-proportion concat sweep. Never touches loose .ts files outside a
+                    node directory - use -r for those.
+  -r/--run-all      Organizes every loose tree sequence file, simulates/maps/concats each
+                    experiment with the default six-proportion sweep. No other arguments.
+  null              Simulates/filters/concats the null experiment only.
+  <relative_dir>    Simulates/maps/concats an already-existing experiment directory (relative
+                    to the simulations dir) against null, applying --np/--ap/-p/interval if given.
 """
 
 from __future__ import annotations
@@ -25,13 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from simulate_sequences import simulate_ts_to_fasta, get_output_dir
 from concat_sequences import (
-    construct_indexed_path,
-    find_existing_chunk_indices,
-    get_phlag_dir,
     get_experiment_folder_name,
     get_experiment_relative_path,
     get_chunk_index,
-    main as concat_main,
+    concatenate_pair,
 )
 # Standard 37 Palaeognathae and Galloanserae outgroup taxa
 OUTGROUP_TAXA = {
@@ -187,6 +190,17 @@ def get_base_name(path: str | Path | None) -> str:
         if name.lower().endswith(ext):
             return name[:-len(ext)]
     return Path(path).stem
+
+
+DEFAULT_CENTERED_PROPORTIONS = [0.02, 0.05, 0.1, 0.15, 0.20, 0.25]
+
+
+def proportion_to_centered_interval(proportion: float) -> str:
+    """Converts a proportion of total sequence length into a percentage interval string centered at the midpoint (50%)."""
+    half_width = (proportion * 100) / 2
+    start = 50 - half_width
+    end = 50 + half_width
+    return f"{start:g}-{end:g}"
 
 
 KNOWN_CHANGES_MAP = {
@@ -482,208 +496,82 @@ def extract_branch_name_from_filename(path: str | Path | None) -> str | None:
     return extracted
 
 
-def normalize_and_rename_file(file_path: str | Path | None) -> Path | None:
+def ensure_mapping(node_label: str, exp_rel: Path, output_dir: Path) -> Path:
     """
-    Checks if a file path or legacy filename should be renamed to standard format.
-    Renames the file on disk if it exists and needs renaming, preserving existing files.
+    Checks if the mapping file exists at its single deterministic location
+    (output_dir/exp_rel/<tree>_<label>_mapping.tsv), otherwise generates it. Tries the Neoaves
+    species tree first, then the full Avian species tree; errors if the internal node is in
+    neither.
     """
-    if not file_path:
-        return None
-    p = Path(file_path)
-    if not p.exists():
-        return p
-    new_name = generate_new_filename(p)
-    if new_name == p.name:
-        return p
+    import treeswift as ts
 
-    new_path = p.parent / new_name
-    if p != new_path:
-        if new_path.exists():
-            print(f"[Auto-Rename] Target standard file already exists: {new_path}, keeping {p.name}", file=sys.stderr)
-            return new_path
-        else:
-            print(f"[Auto-Rename] Standardizing filename on disk: {p.name} -> {new_name}", file=sys.stderr)
-            try:
-                p.rename(new_path)
-            except Exception as e:
-                print(f"[Auto-Rename Warning] Could not rename {p} -> {new_path}: {e}", file=sys.stderr)
-                return p
-            return new_path
-    return p
+    target_node = node_label.split("_")[0] if "_" in node_label else node_label
 
+    tree_candidates = [
+        (REPO_ROOT / "speciestree" / "main-neoaves-numgen.nwk", "neoaves"),
+        (REPO_ROOT / "speciestree" / "main-avian-numgen.nwk", "avian"),
+    ]
 
-def ensure_mapping(tree_path: Path, node_label: str, mapping_path: Path = None, exp_name: str = None, output_dir: Path = None) -> Path:
-    """Checks if mapping file exists, otherwise generates it using species tree & internal node."""
-    tree_stem = "neoaves"
+    tree_path = None
+    tree_stem = None
+    for candidate_path, candidate_stem in tree_candidates:
+        if not candidate_path.exists():
+            continue
+        tree = ts.read_tree_newick(candidate_path)
+        if target_node in tree.label_to_node(selection="all"):
+            tree_path = candidate_path
+            tree_stem = candidate_stem
+            break
+
+    if tree_path is None:
+        sys.exit(
+            f"Error: Internal node '{target_node}' not found in either species tree "
+            f"(main-neoaves-numgen.nwk or main-avian-numgen.nwk)."
+        )
+
     formatted_label = node_label
     if "_" in node_label:
         parts = node_label.split("_")
-        target_node = parts[0]
         source_node = parts[1]
         clade = get_admixture_source_clade(tree_path, target_node, source_node)
         formatted_label = f"{target_node}:{clade}"
 
     target_name = f"{tree_stem}_{formatted_label}_mapping.tsv"
-    
-    if output_dir is None:
-        output_dir = get_output_dir()
-    phlag_dir = get_phlag_dir()
-    exp_rel = get_experiment_relative_path(exp_name or node_label) if (exp_name or node_label) else None
-    desired_dir = output_dir / exp_rel if exp_rel else (output_dir / exp_name if exp_name else output_dir)
+    mapping_dir = output_dir / exp_rel
+    mapping_path = mapping_dir / target_name
 
-    if mapping_path is None:
-        candidates = []
-        if exp_rel:
-            candidates.append(output_dir / exp_rel / target_name)
-            candidates.append(phlag_dir / "simulations" / exp_rel / target_name)
-        if exp_name:
-            candidates.append(output_dir / exp_name / target_name)
-            candidates.append(phlag_dir / "simulations" / exp_name / target_name)
-        candidates.append(output_dir / target_name)
-
-        for cand in candidates:
-            if cand.exists():
-                mapping_path = cand
-                break
-                
-        if mapping_path is None:
-            desired_dir.mkdir(parents=True, exist_ok=True)
-            mapping_path = desired_dir / target_name
-
-    # Relocate mapping file to standard directory structure if it currently exists in a non-relativized path
     if mapping_path.exists():
-        if desired_dir and mapping_path.parent != desired_dir:
-            desired_dir.mkdir(parents=True, exist_ok=True)
-            desired_path = desired_dir / target_name
-            if not desired_path.exists():
-                print(f"[Simulate] Moving mapping file to directory format: {mapping_path} -> {desired_path}", file=sys.stderr)
-                mapping_path.rename(desired_path)
-                mapping_path = desired_path
-            else:
-                mapping_path = desired_path
-        print(f"[1/4 Check Mapping] Mapping file already exists: {mapping_path}", file=sys.stderr)
-    else:
-        if not tree_path.exists():
-            sys.exit(f"Error: Species tree file does not exist: {tree_path}")
-        print(f"[1/4 Check Mapping] Mapping file missing. Generating mapping for tree='{tree_path}' node='{node_label}' -> {mapping_path}...", file=sys.stderr)
-        generate_mapping(tree_path, node_label, mapping_path)
+        print(f"[Mapping] Mapping file already exists: {mapping_path}", file=sys.stderr)
+        return mapping_path
+
+    mapping_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Mapping] Generating mapping for node='{node_label}' (tree={tree_stem}) -> {mapping_path}...", file=sys.stderr)
+    generate_mapping(tree_path, node_label, mapping_path)
     return mapping_path
 
 
-def ensure_sequence_simulated(input_file: Path, output_dir: Path, mutation_rate: float = 1.9086e-08, skip_neoaves: bool = False, design: str = None) -> Path:
+def ensure_sequence_simulated(ts_path: Path, output_dir: Path, mutation_rate: float = 1.9086e-08) -> Path:
     """
-    Checks if a sequence file is simulated as FASTA in output_dir/<exp_rel>/simulated/<base_name>.fa.
-    If only .ts exists (or path to .ts), simulates it to FASTA.
+    Ensures the tree sequence at ts_path (expected at output_dir/<exp_rel>/ts/<name>.ts) is
+    simulated to output_dir/<exp_rel>/simulated/<name>.fa, simulating it if missing. No
+    candidate-path search and no move/rename side effect - errors if ts_path itself is missing.
     """
-    base_name = get_base_name(input_file)
-    exp_name = get_experiment_folder_name(input_file)
-    exp_rel = get_experiment_relative_path(input_file)
-    chunk_idx = get_chunk_index(base_name)
-    simulated_name = f"{chunk_idx}.fa" if chunk_idx else f"{base_name}.fa"
-
-    # Throw error if alternative sequence chunk index > 3
-    s_lower = str(input_file).lower()
-    is_alt_by_name = input_file.name.lower().startswith("a") or any(kw in s_lower for kw in ("anomaly", "alt", "anom", "admixture", "recombination", "10x"))
-    is_alt = is_alt_by_name or (exp_name != "null" and input_file.name.startswith("alt"))
-    if is_alt and chunk_idx and chunk_idx.isdigit() and int(chunk_idx) > 3:
-        sys.exit(f"Error: Cannot simulate alternative chunk '{input_file.name}': chunk index {chunk_idx} exceeds maximum allowed index of 3.")
-
+    exp_rel = get_experiment_relative_path(ts_path)
+    name = get_base_name(ts_path)
     sim_dir = output_dir / exp_rel / "simulated"
-    sim_dir.mkdir(parents=True, exist_ok=True)
+    target_fa = sim_dir / f"{name}.fa"
 
-    # If already a FASTA file that exists
-    if input_file.exists() and input_file.is_file() and (input_file.suffix == ".fa" or str(input_file).endswith(".fa")):
-        print(f"[2/4 Check Simulation] FASTA sequence file exists: {input_file}", file=sys.stderr)
-        return input_file
-
-    target_fa = sim_dir / simulated_name
     if target_fa.exists():
-        print(f"[2/4 Check Simulation] Simulated FASTA already exists: {target_fa}", file=sys.stderr)
+        print(f"[Simulate] Simulated FASTA already exists: {target_fa}", file=sys.stderr)
         return target_fa
 
-    # Look for tree sequence (.ts) file
-    ts_path = input_file
-    if not (ts_path.exists() and ts_path.is_file() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts"))):
-        phlag_dir = get_phlag_dir()
-        ts_candidates = []
-        if chunk_idx:
-            ts_candidates.extend([
-                output_dir / exp_rel / "ts" / f"{chunk_idx}.ts",
-                output_dir / exp_rel / f"{chunk_idx}.ts",
-                output_dir / exp_rel / "ts" / f"default-500Kb-{chunk_idx}.ts",
-                output_dir / exp_rel / "ts" / f"default-{chunk_idx}.ts",
-                output_dir / exp_rel / "ts" / f"null-{chunk_idx}.ts",
-                output_dir / exp_rel / "ts" / f"favian-500Kb-{chunk_idx}.ts",
-                output_dir / exp_name / "ts" / f"{chunk_idx}.ts",
-                output_dir / exp_name / f"{chunk_idx}.ts",
-                output_dir / exp_name / "ts" / f"default-500Kb-{chunk_idx}.ts",
-                output_dir / exp_name / "ts" / f"default-{chunk_idx}.ts",
-                output_dir / exp_name / "ts" / f"null-{chunk_idx}.ts",
-                output_dir / exp_name / "ts" / f"favian-500Kb-{chunk_idx}.ts",
-                output_dir / "null" / "ts" / f"default-500Kb-{chunk_idx}.ts",
-                output_dir / "null" / "ts" / f"default-{chunk_idx}.ts",
-                output_dir / "null" / "ts" / f"null-{chunk_idx}.ts",
-                output_dir / "null" / "ts" / f"{chunk_idx}.ts",
-            ])
-        ts_candidates.extend([
-            output_dir / exp_rel / "ts" / f"{base_name}.ts",
-            output_dir / exp_rel / f"{base_name}.ts",
-            output_dir / exp_name / "ts" / f"{base_name}.ts",
-            output_dir / exp_name / f"{base_name}.ts",
-            output_dir / "ts" / f"{base_name}.ts",
-            input_file.with_suffix(".ts"),
-            input_file.parent / f"{base_name}.ts",
-        ])
+    if not ts_path.exists():
+        sys.exit(f"Error: Tree sequence file does not exist: {ts_path}")
 
-        # Also check parents up to output_dir for loose .ts files
-        p_curr = input_file.parent if input_file.is_file() else input_file
-        while p_curr and p_curr != output_dir and p_curr != p_curr.parent:
-            if chunk_idx:
-                ts_candidates.append(p_curr / f"{chunk_idx}.ts")
-            ts_candidates.append(p_curr / f"{base_name}.ts")
-            p_curr = p_curr.parent
-        
-        if design:
-            ts_candidates.insert(0, phlag_dir / design / "ts" / f"{base_name}.ts")
-            if chunk_idx:
-                ts_candidates.insert(0, phlag_dir / design / "ts" / f"default-500Kb-{chunk_idx}.ts")
-                ts_candidates.insert(0, phlag_dir / design / "ts" / f"{chunk_idx}.ts")
-        
-        ts_candidates.append(phlag_dir / "ts" / f"{base_name}.ts")
-        
-        for cand in ts_candidates:
-            if cand.exists():
-                ts_path = cand
-                break
-
-    if ts_path.exists() and (ts_path.suffix == ".ts" or str(ts_path).endswith(".ts")):
-        desired_ts_dir = output_dir / exp_rel / "ts" if exp_rel else (output_dir / exp_name / "ts" if exp_name else ts_path.parent)
-        desired_name = ts_path.name
-        if exp_name == "null" or ts_path.name.startswith("default"):
-            desired_name = f"null-{chunk_idx}.ts" if chunk_idx else "null.ts"
-        elif chunk_idx and not ts_path.name.startswith(base_name):
-            desired_name = f"{chunk_idx}.ts"
-            
-        desired_path = desired_ts_dir / desired_name
-        if ts_path != desired_path:
-            desired_ts_dir.mkdir(parents=True, exist_ok=True)
-            if desired_path.exists():
-                print(f"[Simulate] Overwriting existing tree sequence: {ts_path} -> {desired_path}", file=sys.stderr)
-                desired_path.unlink()
-            else:
-                print(f"[Simulate] Moving tree sequence {ts_path} -> {desired_path}", file=sys.stderr)
-            ts_path.rename(desired_path)
-            ts_path = desired_path
-
-        print(f"[2/4 Check Simulation] Simulating sequence for {ts_path} -> {target_fa}...", file=sys.stderr)
-        simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
-        return target_fa
-    elif (input_file.parent / simulated_name).exists():
-        return input_file.parent / simulated_name
-    elif (input_file.parent / f"{base_name}.fa").exists():
-        return input_file.parent / f"{base_name}.fa"
-    else:
-        sys.exit(f"Error: Neither FASTA nor tree sequence file exists for base name: '{base_name}' ({input_file})")
+    sim_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Simulate] Simulating {ts_path} -> {target_fa}...", file=sys.stderr)
+    simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
+    return target_fa
 
 
 def ensure_neoaves_filtered(fasta_path: Path) -> Path:
@@ -712,27 +600,234 @@ def ensure_neoaves_filtered(fasta_path: Path) -> Path:
     return fasta_path
 
 
+def _rename_ts_dir(ts_dir: Path) -> list[Path]:
+    """
+    Renames any non-numerically-named .ts file in ts_dir to its canonical chunk-index name
+    (matching what organize_loose_ts_files() would have produced), leaving already-numeric names
+    untouched. Errors if a chunk index can't be determined, or the canonical name is already
+    taken by a different file. Returns the final list of .ts files in ts_dir.
+    """
+    if not ts_dir.is_dir():
+        return []
+
+    ts_files = []
+    for ts_file in sorted(ts_dir.iterdir()):
+        if not ts_file.is_file():
+            continue
+        stem = get_base_name(ts_file)
+        if stem.isdigit():
+            ts_files.append(ts_file)
+            continue
+
+        chunk_idx = get_chunk_index(stem) or get_chunk_index(Path(generate_new_filename(ts_file)).stem)
+        if not chunk_idx:
+            sys.exit(f"Error: Could not determine chunk index for '{ts_file}'.")
+
+        canonical = ts_dir / f"{chunk_idx}.ts"
+        if canonical.exists() and canonical != ts_file:
+            sys.exit(f"Error: Cannot rename '{ts_file}' -> '{canonical}': target already exists.")
+
+        print(f"[Simulate] Renaming {ts_file.name} -> {canonical.name}", file=sys.stderr)
+        ts_file.rename(canonical)
+        ts_files.append(canonical)
+
+    return ts_files
+
+
+def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mutation_rate: float) -> list[Path]:
+    """
+    Shared by run_all() and run_ensure_all(): derives exp_dir's branch/node label strictly from
+    its directory name, ensures its mapping, simulates+filters every given ts file, then runs the
+    default six-proportion concat sweep. Returns the concat files created.
+    """
+    rel_dir = exp_dir.relative_to(output_dir)
+    node_label = extract_branch_name_from_filename(rel_dir) or extract_branch_name(rel_dir)
+    if not node_label:
+        sys.exit(f"Error: Could not derive a branch/internal-node label from directory name '{rel_dir}'.")
+    ensure_mapping(node_label, rel_dir, output_dir)
+
+    for ts_path in ts_files:
+        sim_fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(sim_fa)
+
+    return [
+        concatenate_pair(Path("null"), exp_dir, output_dir, interval=proportion_to_centered_interval(p))
+        for p in DEFAULT_CENTERED_PROPORTIONS
+    ]
+
+
+def run_all(output_dir: Path, mutation_rate: float) -> None:
+    """
+    -r/--run-all: organizes every loose .ts file into its experiment directory, simulates only
+    those files to FASTA (always Neoaves-filtered), ensures each experiment's mapping, then runs
+    the default six-proportion concat sweep for each experiment. Single fixed behavior - the
+    caller (main()) rejects any pattern/interval override before this is called.
+    """
+    from organize_simulations import organize_loose_ts_files
+    all_ts_files = organize_loose_ts_files(output_dir)
+
+    if not all_ts_files:
+        print(f"No loose tree sequence (.ts) files found under '{output_dir}'.", file=sys.stderr)
+        return
+
+    print(f"[Simulate -r] Found {len(all_ts_files)} loose tree sequence file(s) under '{output_dir}'. Processing...", file=sys.stderr)
+
+    exp_to_ts = {}
+    for ts_path in all_ts_files:
+        exp_name = get_experiment_folder_name(ts_path)
+        exp_to_ts.setdefault(exp_name, []).append(ts_path)
+
+    concat_files_created = []
+    for exp_name, ts_files in exp_to_ts.items():
+        print(f"\n==========================================", file=sys.stderr)
+        print(f"[Simulate -r] Processing Experiment: {exp_name}", file=sys.stderr)
+        print(f"==========================================", file=sys.stderr)
+
+        exp_rel = get_experiment_relative_path(ts_files[0])
+        exp_dir = output_dir / exp_rel
+
+        if exp_name == "null":
+            for ts_path in ts_files:
+                sim_fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+                ensure_neoaves_filtered(sim_fa)
+            print(f"\n[Simulate -r] Running default concat sweep for null...", file=sys.stderr)
+            for proportion in DEFAULT_CENTERED_PROPORTIONS:
+                interval = proportion_to_centered_interval(proportion)
+                concat_files_created.append(concatenate_pair(Path("null"), None, output_dir, interval=interval))
+        else:
+            print(f"\n[Simulate -r] Running default concat sweep for {exp_name}...", file=sys.stderr)
+            concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate))
+
+    print(f"\n[Simulate -r] All simulations completed successfully.", file=sys.stderr)
+    print(f"\n[Simulate -r] Concat files created ({len(concat_files_created)}):")
+    for cf in concat_files_created:
+        print(f"  {cf}")
+
+
+def run_ensure_all(output_dir: Path, mutation_rate: float) -> None:
+    """
+    No-target mode: for every already-organized node experiment directory
+    (10X/{up,down}/*, recombination/{up,down}/*, admixture/{low,high}/*) - null is skipped, and
+    loose .ts files outside a node directory are never touched, that's -r's job - renames any
+    non-numerically-named .ts file in its ts/ folder, simulates/filters every chunk, ensures its
+    mapping, and runs the default six-proportion concat sweep.
+    """
+    exp_dirs = []
+    for category in ("10X", "recombination"):
+        for direction in ("up", "down"):
+            base = output_dir / category / direction
+            if base.is_dir():
+                exp_dirs.extend(sorted(p for p in base.iterdir() if p.is_dir()))
+    for level in ("low", "high"):
+        base = output_dir / "admixture" / level
+        if base.is_dir():
+            exp_dirs.extend(sorted(p for p in base.iterdir() if p.is_dir()))
+
+    concat_files_created = []
+    for exp_dir in exp_dirs:
+        rel_dir = exp_dir.relative_to(output_dir)
+        print(f"\n[Simulate] Ensuring experiment complete: {rel_dir}", file=sys.stderr)
+        ts_files = _rename_ts_dir(exp_dir / "ts")
+        concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate))
+
+    print(f"\n[Simulate] {len(exp_dirs)} experiment director{'y' if len(exp_dirs) == 1 else 'ies'} ensured complete.")
+    print(f"[Simulate] Concat files created ({len(concat_files_created)}):")
+    for cf in concat_files_created:
+        print(f"  {cf}")
+
+
+def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
+    """The literal 'null' target: simulates/filters the needed null chunks, then concatenates -
+    an explicit interval if given, else the default six-proportion sweep."""
+    matches = re.findall(r'[an](\d+)', np_pattern.lower())
+    null_chunk_indices = [int(m) for m in matches] if matches else list(range(1, 13))
+    for idx in null_chunk_indices:
+        ts_path = output_dir / "null" / "ts" / f"{idx}.ts"
+        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa)
+
+    if interval:
+        return [concatenate_pair(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
+
+    return [
+        concatenate_pair(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
+        for p in DEFAULT_CENTERED_PROPORTIONS
+    ]
+
+
+def run_relative_dir(output_dir: Path, rel_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
+    """
+    The <relative_dir> target: must be a relative path to an already-existing experiment
+    directory under output_dir - this mode never creates a new experiment from scratch, that's
+    what -r is for. Simulates/maps the alt chunks in that directory, ensures the shared null
+    chunks needed, then concatenates - an explicit interval if given, else the default
+    six-proportion sweep. Branch/mapping is derived strictly from the directory name.
+    """
+    if rel_dir.is_absolute():
+        sys.exit(f"Error: Target must be a relative path under the simulations directory, got absolute path: {rel_dir}")
+
+    exp_dir = output_dir / rel_dir
+    if not exp_dir.is_dir():
+        sys.exit(f"Error: Experiment directory does not exist: {exp_dir}. Run -r first to organize new tree sequences.")
+
+    computed_exp_rel = get_experiment_relative_path(exp_dir)
+    if computed_exp_rel != rel_dir:
+        sys.exit(
+            f"Error: '{rel_dir}' does not match its deterministic experiment path "
+            f"'{computed_exp_rel}'. The directory may be misplaced or misnamed."
+        )
+
+    node_label = extract_branch_name_from_filename(rel_dir) or extract_branch_name(rel_dir)
+    if not node_label:
+        sys.exit(f"Error: Could not derive a branch/internal-node label from directory name '{rel_dir}'.")
+
+    ensure_mapping(node_label, rel_dir, output_dir)
+
+    alt_matches = re.findall(r'[an](\d+)', ap_pattern.lower())
+    alt_chunk_indices = [int(m) for m in alt_matches] if alt_matches else [1, 2, 3]
+    for idx in alt_chunk_indices:
+        ts_path = exp_dir / "ts" / f"{idx}.ts"
+        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa)
+
+    null_matches = re.findall(r'[an](\d+)', np_pattern.lower())
+    null_chunk_indices = [int(m) for m in null_matches] if null_matches else list(range(1, 13))
+    for idx in null_chunk_indices:
+        ts_path = output_dir / "null" / "ts" / f"{idx}.ts"
+        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa)
+
+    if interval:
+        return [concatenate_pair(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
+
+    return [
+        concatenate_pair(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
+        for p in DEFAULT_CENTERED_PROPORTIONS
+    ]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run sequence simulation pipeline: check mapping, simulate tree sequences, filter Neoaves, and concat sequences."
+        description=(
+            "Run the sequence simulation pipeline. Four modes: no target runs a read-only "
+            "structure audit; -r/--run-all organizes and simulates every loose tree sequence "
+            "with the default sweep; 'null' simulates/concats the null experiment only; a "
+            "relative path to an existing experiment directory simulates/maps/concats it."
+        )
     )
-
     parser.add_argument(
-        "positional_args",
+        "target",
         type=str,
-        nargs="*",
-        help="Sequence base names or files to concatenate, or (null_base, alt_base, pattern).",
+        nargs="?",
+        default=None,
+        help="'null', or a relative path (under the simulations dir) to an existing experiment directory. Omit entirely to run a read-only structure audit.",
     )
-
-    parser.add_argument("-n", "--null", type=Path, help="Base name or path for null sequence (without .ts or .fa).")
     parser.add_argument(
-        "-a",
-        "--alt",
-        "--alternative",
-        "--anomalous",
-        type=Path,
-        dest="alt",
-        help="Base name or path for alternative/anomalous sequence (without .ts or .fa).",
+        "interval",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Optional explicit insertion interval (e.g. '40-60'). If omitted, the default six-proportion centered sweep is used.",
     )
     parser.add_argument(
         "-p", "--prop", "--proportion",
@@ -748,275 +843,47 @@ def main(argv=None):
         "--ap", "--alt-pattern", type=str, default="a1a2a3", help="Alternative pattern string specifying alt chunk order."
     )
     parser.add_argument(
-        "-t", "--tree", "--input-tree",
-        dest="input_tree",
-        type=Path,
-        default=None,
-        help="Species tree path for mapping check."
-    )
-    parser.add_argument(
-        "-b", "--branch", "--node", "--internal-node",
-        dest="internal_node",
-        type=str,
-        default=None,
-        help="Internal node label for mapping check (extracted from filename if omitted)."
-    )
-    parser.add_argument(
-        "--extract-branch", "--branch-only",
-        action="store_true",
-        dest="extract_branch_only",
-        help="Output extracted branch name for given sequence file(s) and exit."
-    )
-    parser.add_argument(
-        "-m", "--mapping",
-        type=Path,
-        default=None,
-        help="Output or existing mapping TSV path."
-    )
-    parser.add_argument(
         "-mrate", "--mutation-rate",
         type=float,
         default=1.9086e-08,
         help="Mutation rate for sequence simulation."
     )
     parser.add_argument(
-        "--skip-neoaves",
-        action="store_true",
-        help="Skip Neoaves outgroup filtering."
-    )
-    parser.add_argument(
-        "--design",
-        type=str,
-        default=None,
-        help="High-level design name (model parameters) under PHLAG_DIR to look for tree sequences."
-    )
-    parser.add_argument(
         "-r", "--recursive", "--run-all",
         action="store_true",
         dest="run_all",
-        help="Simulate all tree sequence (.ts) files recursively in store/simulations."
+        help="Organize every loose tree sequence file and simulate/map/concat each experiment with the default centered-proportion sweep."
     )
-    parser.add_argument("-o", "--output", type=Path, required=False, help="Output FASTA path.")
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
 
+    has_overrides = bool(
+        args.interval or args.proportion
+        or args.np != "n1n2n3n4n5n6n7n8n9n10n11n12"
+        or args.ap != "a1a2a3"
+    )
+
     if args.run_all:
-        all_ts_files = []
-        try:
-            from organize_simulations import organize_loose_ts_files
-            all_ts_files = organize_loose_ts_files(output_dir)
-        except ImportError as e:
-            print(f"[Warning] Could not import organize_simulations: {e}", file=sys.stderr)
+        if args.target is not None or has_overrides:
+            sys.exit("Error: -r/--run-all does not accept a target, interval, or --np/--ap/-p overrides - it always organizes and simulates every experiment with the default sweep.")
+        run_all(output_dir, args.mutation_rate)
+        return
 
-        if not all_ts_files:
-            print(f"No loose tree sequence (.ts) files found under '{output_dir}'.", file=sys.stderr)
-            sys.exit(0)
+    if args.target is None:
+        if has_overrides:
+            sys.exit("Error: No target given. Pass 'null' or a relative experiment directory to use --np/--ap/-p/interval; omit all arguments to ensure every node experiment directory is complete.")
+        run_ensure_all(output_dir, args.mutation_rate)
+        return
 
-        print(f"[Simulate -r] Found {len(all_ts_files)} loose tree sequence file(s) under '{output_dir}'. Processing...", file=sys.stderr)
-        
-        exp_to_ts = {}
-        for ts_path in all_ts_files:
-            exp_name = get_experiment_folder_name(ts_path)
-            exp_to_ts.setdefault(exp_name, []).append(ts_path)
-
-        for exp_name, ts_files in exp_to_ts.items():
-            print(f"\n==========================================", file=sys.stderr)
-            print(f"[Simulate -r] Processing Experiment: {exp_name}", file=sys.stderr)
-            print(f"==========================================", file=sys.stderr)
-            
-            node_label = args.internal_node
-            if not node_label and exp_name != "null":
-                for ts_path in ts_files:
-                    extracted = extract_branch_name_from_filename(ts_path) or extract_branch_name(ts_path)
-                    if extracted:
-                        node_label = extracted
-                        break
-
-            tree_path = args.input_tree or (REPO_ROOT / "speciestree" / "main-neoaves-numgen.nwk")
-            if node_label and exp_name != "null":
-                ensure_mapping(tree_path, node_label, args.mapping, exp_name=str(ts_files[0]), output_dir=output_dir)
-
-            for ts_path in ts_files:
-                sim_fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves, design=args.design)
-                if not args.skip_neoaves:
-                    ensure_neoaves_filtered(sim_fa)
-
-            print(f"\n[Simulate -r] Running default concatenation for {exp_name}...", file=sys.stderr)
-            concat_argv = ["-a", str(ts_files[0])] if exp_name != "null" else []
-            concat_argv.extend(["40-65"])
-            if args.design:
-                concat_argv.extend(["--design", args.design])
-            concat_main(concat_argv)
-
-        print(f"\n[Simulate -r] All simulations completed successfully.", file=sys.stderr)
-        sys.exit(0)
-
-    if args.extract_branch_only:
-        targets = []
-        if args.null:
-            targets.append(args.null)
-        if args.alt:
-            targets.append(args.alt)
-        targets.extend([Path(p) for p in args.positional_args if p])
-
-        if not targets:
-            sys.exit("Error: Must specify sequence file(s) or -n/-a to extract branch from.")
-
-        for target in targets:
-            bname = extract_branch_name_from_filename(target) or extract_branch_name(target)
-            print(f"{target}: {bname}")
-        sys.exit(0)
-
-    if args.null:
-        args.null = normalize_and_rename_file(args.null)
-    if args.alt:
-        args.alt = normalize_and_rename_file(args.alt)
-    pos = [normalize_and_rename_file(Path(p)) for p in args.positional_args if p]
-
-    # Determine input files for simulation / filtering / concat
-    coord_parts = []
-    file_pos = []
-    for p in pos:
-        name_clean = p.name.lower().strip()
-        is_interval = bool(re.match(r"^[\d\.,\-_kmb]+$", name_clean))
-        if is_interval and not p.exists():
-            coord_parts.append(p.name)
-        else:
-            file_pos.append(p)
-
-    null_path = args.null
-    if not null_path and len(file_pos) > 1:
-        null_path = file_pos.pop(0)
-
-    alt_path = args.alt
-    if not alt_path and file_pos:
-        alt_path = file_pos.pop(0)
-
-    if not null_path:
-        null_path = Path("null")
-
-    if not coord_parts:
-        coord_parts = ["40-65"]
-        print(f"No interval provided. Defaulting to interval: {coord_parts[0]}", file=sys.stderr)
-
-    interval_str = ",".join(coord_parts)
-
-    # is_pattern_mode is True if we are doing any kind of concatenation
-    # that involves `--np`, `--ap`, intervals, or proportions.
-    is_pattern_mode = True if (alt_path or coord_parts or args.np != "n1n2n3n4n5n6n7n8n9n10n11n12" or args.ap != "a1a2a3" or args.proportion) else False
-
-    target_files = []
-    if is_pattern_mode:
-        if alt_path:
-            # Parse needed alt chunks from --ap
-            matches = re.findall(r'[an](\d+)', args.ap.lower())
-            alt_chunk_indices = [int(m) for m in matches] if matches else [1, 2, 3]
-            exp_rel = get_experiment_relative_path(alt_path)
-            for idx in alt_chunk_indices:
-                cf = output_dir / exp_rel / "ts" / f"{idx}.ts"
-                target_files.append(cf)
-        else:
-            print("Note: No alternative sequence explicitly provided. Simulating null sequence blocks.", file=sys.stderr)
-        
-        # Parse needed null chunks from --np
-        matches = re.findall(r'[an](\d+)', args.np.lower())
-        null_chunk_indices = [int(m) for m in matches] if matches else [i for i in range(1, 13)]
-        for idx in null_chunk_indices:
-            cf = output_dir / "null" / "ts" / f"{idx}.ts"
-            target_files.append(cf)
+    if args.target == "null":
+        concat_files = run_null(output_dir, args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
     else:
-        target_files = [null_path] + [alt_path] if alt_path else [null_path]
+        concat_files = run_relative_dir(output_dir, Path(args.target), args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
 
-    for tf in target_files:
-        if tf and tf.name != "null":
-            ensure_sequence_simulated(tf, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves, design=args.design)
-
-    # 1. Check Mapping
-    tree_path = args.input_tree
-    if tree_path is None:
-        tree_path = REPO_ROOT / "speciestree" / "main-neoaves-numgen.nwk"
-
-    # Extract branch name from filename/path if available
-    node_label = args.internal_node
-    if not node_label:
-        candidates_to_check = pos + ([alt_path] if alt_path else []) + target_files
-        for cand_file in candidates_to_check:
-            if cand_file and str(cand_file).lower() != "null":
-                extracted = extract_branch_name_from_filename(cand_file) or extract_branch_name(cand_file)
-                if extracted and not extracted.isdigit() and extracted not in ("null", "default", "ts", "simulated", "concat", "store"):
-                    node_label = extracted
-                    break
-
-    exp_names = set()
-    for tf in target_files:
-        exp_names.add(get_experiment_folder_name(tf))
-    if is_pattern_mode:
-        if alt_path:
-            exp_names.add(get_experiment_folder_name(alt_path))
-        if null_path:
-            exp_names.add(get_experiment_folder_name(null_path))
-
-    if "null" in exp_names and len(exp_names) > 1:
-        exp_names.remove("null")
-
-    if not exp_names:
-        exp_names.add("default")
-
-    is_null_only = exp_names == {"null"}
-
-    if not is_null_only:
-        if not node_label or node_label.isdigit() or node_label in ("null", "default", "ts", "simulated", "concat", "store"):
-            sys.exit(f"Error: Could not extract a valid internal node label from '{alt_path or (pos[0] if pos else 'input')}'. Please specify --node / --branch explicitly.")
-
-    if not is_null_only:
-        exp_targets = set()
-        if alt_path:
-            exp_targets.add(str(alt_path))
-        if pos:
-            for p in pos:
-                if str(p).lower() != "null":
-                    exp_targets.add(str(p))
-        if not exp_targets:
-            for tf in target_files:
-                if str(tf).lower() != "null":
-                    exp_targets.add(str(tf))
-        
-        for target in sorted(exp_targets):
-            ensure_mapping(tree_path, node_label, args.mapping, exp_name=target, output_dir=output_dir)
-
-    # 2. Check Sequence Simulation & 3. Check Neoaves Filter
-    processed_files = []
-    for tf in target_files:
-        sim_fa = ensure_sequence_simulated(tf, output_dir, mutation_rate=args.mutation_rate, skip_neoaves=args.skip_neoaves, design=args.design)
-        if not args.skip_neoaves:
-            filtered_fa = ensure_neoaves_filtered(sim_fa)
-            processed_files.append(filtered_fa)
-        else:
-            processed_files.append(sim_fa)
-
-    # 4. Run Concat Sequences
-    print(f"\n[4/4 Concat Sequences] Concatenating sequence files...", file=sys.stderr)
-    
-    if is_pattern_mode:
-        concat_argv = ["-n", str(null_path)]
-        if alt_path:
-            concat_argv.extend(["-a", str(alt_path)])
-        concat_argv.extend(["--np", args.np, "--ap", args.ap])
-
-        if coord_parts:
-            concat_argv.extend(coord_parts)
-        if args.proportion:
-            concat_argv.extend(["-p", str(args.proportion)])
-    else:
-        concat_argv = [str(f) for f in processed_files]
-
-    if args.output:
-        concat_argv.extend(["-o", str(args.output)])
-    if args.design:
-        concat_argv.extend(["--design", args.design])
-
-    concat_main(concat_argv)
+    print(f"\n[Simulate] Concat files created ({len(concat_files)}):")
+    for cf in concat_files:
+        print(f"  {cf}")
 
 
 if __name__ == "__main__":
