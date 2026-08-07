@@ -31,10 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from simulate_sequences import simulate_ts_to_fasta, get_output_dir
 from concat_sequences import (
-    get_experiment_folder_name,
     get_experiment_relative_path,
     get_chunk_index,
     concatenate_pair,
+    get_missing_alt_chunk_warnings,
 )
 # Standard 37 Palaeognathae and Galloanserae outgroup taxa
 OUTGROUP_TAXA = {
@@ -322,6 +322,8 @@ def parse_filename(path_or_str: str | Path) -> dict:
             p_obj = Path(path_or_str)
             reserved_folder_names = {"ts", "simulated", "concat", "simulations", "store", "10x", "recombination", "admixture", "up", "down", "low", "high", "iang", "home", "drive2", "root", "none", ".", ".."}
             for part in reversed(p_obj.parts[:-1]):
+                if not part or part in ("/", "\\"):
+                    continue
                 part_clean = part.strip("-_")
                 if part_clean.lower() not in reserved_folder_names and not part_clean.isdigit():
                     m_part_adm = re.search(r"(?:admixture[-_])?([A-Za-z0-9_]+?)[-_](?:admixture[-_])?(rate\d+|0\d+)[-_](time\d+|\d+)", part, re.IGNORECASE)
@@ -550,11 +552,13 @@ def ensure_mapping(node_label: str, exp_rel: Path, output_dir: Path) -> Path:
     return mapping_path
 
 
-def ensure_sequence_simulated(ts_path: Path, output_dir: Path, mutation_rate: float = 1.9086e-08) -> Path:
+def ensure_sequence_simulated(ts_path: Path, output_dir: Path, mutation_rate: float = 1.9086e-08) -> tuple[Path, bool]:
     """
     Ensures the tree sequence at ts_path (expected at output_dir/<exp_rel>/ts/<name>.ts) is
     simulated to output_dir/<exp_rel>/simulated/<name>.fa, simulating it if missing. No
     candidate-path search and no move/rename side effect - errors if ts_path itself is missing.
+    Returns (target_fa, freshly_simulated) - freshly_simulated is False when the FASTA already
+    existed, so callers can skip re-verifying work (e.g. Neoaves filtering) already done for it.
     """
     exp_rel = get_experiment_relative_path(ts_path)
     name = get_base_name(ts_path)
@@ -563,7 +567,7 @@ def ensure_sequence_simulated(ts_path: Path, output_dir: Path, mutation_rate: fl
 
     if target_fa.exists():
         print(f"[Simulate] Simulated FASTA already exists: {target_fa}", file=sys.stderr)
-        return target_fa
+        return target_fa, False
 
     if not ts_path.exists():
         sys.exit(f"Error: Tree sequence file does not exist: {ts_path}")
@@ -571,17 +575,22 @@ def ensure_sequence_simulated(ts_path: Path, output_dir: Path, mutation_rate: fl
     sim_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Simulate] Simulating {ts_path} -> {target_fa}...", file=sys.stderr)
     simulate_ts_to_fasta(ts_path, target_fa, mutation_rate=mutation_rate)
-    return target_fa
+    return target_fa, True
 
 
-def ensure_neoaves_filtered(fasta_path: Path) -> Path:
+def ensure_neoaves_filtered(fasta_path: Path, freshly_simulated: bool = True) -> Path:
     """
-    Checks if a FASTA sequence file is filtered for Neoaves (outgroup taxa removed).
-    Filters it in-place (writing to the same FASTA file) if not already filtered.
+    Filters a freshly-simulated FASTA for Neoaves (removes outgroup taxa) in-place if needed.
     Note: Alt sequences do not require Neoaves filtering (already simulated on Neoaves tree).
+    A FASTA that already existed on disk (freshly_simulated=False) was already filtered the first
+    time it was simulated, since simulation and filtering are always paired - re-verifying its
+    content here would mean re-reading the whole (often 100+MB) file for nothing on every run.
     """
+    if not freshly_simulated:
+        return fasta_path
+
     base_name = get_base_name(fasta_path)
-    
+
     # Alt sequences do not need Neoaves filtering (silent check)
     if base_name.startswith("alt") or "anomaly" in base_name.lower():
         return fasta_path
@@ -634,6 +643,18 @@ def _rename_ts_dir(ts_dir: Path) -> list[Path]:
     return ts_files
 
 
+def _print_run_summary() -> None:
+    """Prints every alt-chunk-unavailable warning recorded during this run, or a success message
+    if there were none (i.e. every requested chunk was found and simulated)."""
+    warnings = get_missing_alt_chunk_warnings()
+    if warnings:
+        print(f"\n[Simulate] {len(warnings)} alt chunk warning(s) during this run:")
+        for w in warnings:
+            print(f"  {w}")
+    else:
+        print(f"\n[Simulate] Success: all requested chunks were fully simulated.")
+
+
 def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mutation_rate: float) -> list[Path]:
     """
     Shared by run_all() and run_ensure_all(): derives exp_dir's branch/node label strictly from
@@ -647,8 +668,8 @@ def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mu
     ensure_mapping(node_label, rel_dir, output_dir)
 
     for ts_path in ts_files:
-        sim_fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
-        ensure_neoaves_filtered(sim_fa)
+        sim_fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(sim_fa, freshly_simulated)
 
     return [
         concatenate_pair(Path("null"), exp_dir, output_dir, interval=proportion_to_centered_interval(p))
@@ -674,34 +695,34 @@ def run_all(output_dir: Path, mutation_rate: float) -> None:
 
     exp_to_ts = {}
     for ts_path in all_ts_files:
-        exp_name = get_experiment_folder_name(ts_path)
-        exp_to_ts.setdefault(exp_name, []).append(ts_path)
+        exp_rel = get_experiment_relative_path(ts_path)
+        exp_to_ts.setdefault(exp_rel, []).append(ts_path)
 
     concat_files_created = []
-    for exp_name, ts_files in exp_to_ts.items():
+    for exp_rel, ts_files in exp_to_ts.items():
         print(f"\n==========================================", file=sys.stderr)
-        print(f"[Simulate -r] Processing Experiment: {exp_name}", file=sys.stderr)
+        print(f"[Simulate -r] Processing Experiment: {exp_rel}", file=sys.stderr)
         print(f"==========================================", file=sys.stderr)
 
-        exp_rel = get_experiment_relative_path(ts_files[0])
         exp_dir = output_dir / exp_rel
 
-        if exp_name == "null":
+        if exp_rel == Path("null"):
             for ts_path in ts_files:
-                sim_fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
-                ensure_neoaves_filtered(sim_fa)
+                sim_fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+                ensure_neoaves_filtered(sim_fa, freshly_simulated)
             print(f"\n[Simulate -r] Running default concat sweep for null...", file=sys.stderr)
             for proportion in DEFAULT_CENTERED_PROPORTIONS:
                 interval = proportion_to_centered_interval(proportion)
                 concat_files_created.append(concatenate_pair(Path("null"), None, output_dir, interval=interval))
         else:
-            print(f"\n[Simulate -r] Running default concat sweep for {exp_name}...", file=sys.stderr)
+            print(f"\n[Simulate -r] Running default concat sweep for {exp_rel}...", file=sys.stderr)
             concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate))
 
     print(f"\n[Simulate -r] All simulations completed successfully.", file=sys.stderr)
     print(f"\n[Simulate -r] Concat files created ({len(concat_files_created)}):")
     for cf in concat_files_created:
         print(f"  {cf}")
+    _print_run_summary()
 
 
 def run_ensure_all(output_dir: Path, mutation_rate: float) -> None:
@@ -734,6 +755,7 @@ def run_ensure_all(output_dir: Path, mutation_rate: float) -> None:
     print(f"[Simulate] Concat files created ({len(concat_files_created)}):")
     for cf in concat_files_created:
         print(f"  {cf}")
+    _print_run_summary()
 
 
 def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
@@ -743,8 +765,8 @@ def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, int
     null_chunk_indices = [int(m) for m in matches] if matches else list(range(1, 13))
     for idx in null_chunk_indices:
         ts_path = output_dir / "null" / "ts" / f"{idx}.ts"
-        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
-        ensure_neoaves_filtered(fa)
+        fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa, freshly_simulated)
 
     if interval:
         return [concatenate_pair(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
@@ -787,15 +809,15 @@ def run_relative_dir(output_dir: Path, rel_dir: Path, np_pattern: str, ap_patter
     alt_chunk_indices = [int(m) for m in alt_matches] if alt_matches else [1, 2, 3]
     for idx in alt_chunk_indices:
         ts_path = exp_dir / "ts" / f"{idx}.ts"
-        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
-        ensure_neoaves_filtered(fa)
+        fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa, freshly_simulated)
 
     null_matches = re.findall(r'[an](\d+)', np_pattern.lower())
     null_chunk_indices = [int(m) for m in null_matches] if null_matches else list(range(1, 13))
     for idx in null_chunk_indices:
         ts_path = output_dir / "null" / "ts" / f"{idx}.ts"
-        fa = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
-        ensure_neoaves_filtered(fa)
+        fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
+        ensure_neoaves_filtered(fa, freshly_simulated)
 
     if interval:
         return [concatenate_pair(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
@@ -809,10 +831,16 @@ def run_relative_dir(output_dir: Path, rel_dir: Path, np_pattern: str, ap_patter
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Run the sequence simulation pipeline. Four modes: no target runs a read-only "
-            "structure audit; -r/--run-all organizes and simulates every loose tree sequence "
-            "with the default sweep; 'null' simulates/concats the null experiment only; a "
-            "relative path to an existing experiment directory simulates/maps/concats it."
+            "Run the sequence simulation pipeline. Four modes, selected by exactly one "
+            "positional target: (no target) ensures every already-organized node experiment "
+            "directory (10X/recombination/admixture; null is skipped) is complete - renames "
+            "non-numeric .ts files, simulates/filters every chunk, ensures mapping, and runs "
+            "the default six-proportion concat sweep; -r/--run-all organizes every loose tree "
+            "sequence file into its experiment directory first, then does the same for every "
+            "experiment including null; 'null' simulates/filters/concats the null experiment "
+            "only; <relative_dir> simulates/maps/concats an already-existing experiment "
+            "directory (relative to the simulations dir) against null, honoring --np/--ap/-p/"
+            "interval overrides."
         )
     )
     parser.add_argument(
@@ -820,14 +848,14 @@ def main(argv=None):
         type=str,
         nargs="?",
         default=None,
-        help="'null', or a relative path (under the simulations dir) to an existing experiment directory. Omit entirely to run a read-only structure audit.",
+        help="'null', or a relative path (under the simulations dir) to an existing experiment directory. Omit entirely to ensure every node experiment directory is complete (see -r to organize new loose tree sequences first).",
     )
     parser.add_argument(
         "interval",
         type=str,
         nargs="?",
         default=None,
-        help="Optional explicit insertion interval (e.g. '40-60'). If omitted, the default six-proportion centered sweep is used.",
+        help="Optional explicit insertion interval (e.g. '40-60'). If omitted, the default six-proportion centered sweep is used. Only valid with target 'null' or <relative_dir>.",
     )
     parser.add_argument(
         "-p", "--prop", "--proportion",
@@ -852,7 +880,7 @@ def main(argv=None):
         "-r", "--recursive", "--run-all",
         action="store_true",
         dest="run_all",
-        help="Organize every loose tree sequence file and simulate/map/concat each experiment with the default centered-proportion sweep."
+        help="Organize every loose tree sequence file and simulate/map/concat each experiment (including null) with the default centered-proportion sweep. Accepts no target, interval, or --np/--ap/-p overrides."
     )
     args = parser.parse_args(argv)
 
@@ -884,6 +912,7 @@ def main(argv=None):
     print(f"\n[Simulate] Concat files created ({len(concat_files)}):")
     for cf in concat_files:
         print(f"  {cf}")
+    _print_run_summary()
 
 
 if __name__ == "__main__":

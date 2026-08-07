@@ -7,4 +7,8 @@ mapping/*.tsv
 # Python / Build Artifacts
 __pycache__/
 *.egg-info/
+
+# Claude
 .agents/
+.claude/
+CLAUDE.md
