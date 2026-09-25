@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import argparse
 from typing import Union
@@ -77,7 +78,7 @@ def get_base_name(path: str | Path | None) -> str:
     if path is None:
         return ""
     name = Path(path).name
-    for ext in (".ts", ".fa", ".fasta"):
+    for ext in (".ts", ".fa", ".fasta", ".gtrees"):
         if name.lower().endswith(ext):
             return name[:-len(ext)]
     return Path(path).stem
@@ -212,6 +213,48 @@ def get_experiment_relative_path(path_or_stem: str | Path | None) -> Path:
         return Path("admixture") / sub / exp_name
 
     sys.exit(f"Error: Could not determine experiment category (10X/recombination/admixture) for '{path_or_stem}' (change={change!r}).")
+
+
+GTREES_EXT = ".gtrees"
+
+# Pre-made gene tree files use their own change names, e.g. 'popsize_decrease_10x-N109-500Kb-1'
+# or 'recombination_suppression-N115-500Kb-1'. canonical_gtrees_stem() rewrites them into the .ts
+# naming parse_filename() already understands, so classification still goes through
+# get_experiment_relative_path() and nothing else.
+GTREES_POPSIZE_DIRECTIONS = {"increase": "up", "up": "up", "decrease": "down", "down": "down", "suppression": "down"}
+_GTREES_ALT_RE = re.compile(r"^(popsize|recombination)_(increase|decrease|suppression|up|down)(?:_10x)?-([A-Za-z0-9_]+)(.*)$", re.IGNORECASE)
+_GTREES_NULL_RE = re.compile(r"^(?:default|null)(?:-neoaves)?(?:-500[Kk][Bb])?(-\d+)?$", re.IGNORECASE)
+
+
+def canonical_gtrees_stem(path_or_name: str | Path) -> str:
+    """
+    Maps a gene tree file name onto the equivalent .ts-style stem:
+      'popsize_increase_10x-Accipitriformes-500Kb-1' -> 'anomaly_case-Accipitriformes_10X_up-500Kb-1'
+      'popsize_decrease_10x-N109-500Kb-1'            -> 'anomaly_case-N109_10X_down-500Kb-1'
+      'recombination_increase_10x-N113-500Kb-1'      -> 'anomaly_case-recombination_increase_N113-500Kb-1'
+      'recombination_suppression-N115-500Kb-1'       -> 'anomaly_case-recombination_suppression_N115-500Kb-1'
+      'default-500Kb-3' / 'null-3'                   -> 'null-3'
+    Any other name is returned unchanged (minus its extension).
+    """
+    stem = get_base_name(path_or_name)
+    m = _GTREES_ALT_RE.match(stem)
+    if m:
+        kind, direction, branch, tail = m.group(1).lower(), m.group(2).lower(), m.group(3), m.group(4)
+        if kind == "popsize":
+            return f"anomaly_case-{branch}_10X_{GTREES_POPSIZE_DIRECTIONS[direction]}{tail}"
+        return f"anomaly_case-recombination_{direction}_{branch}{tail}"
+    m = _GTREES_NULL_RE.match(stem)
+    if m:
+        return f"null{m.group(1) or ''}"
+    return stem
+
+
+def classify_gtrees_file(path: str | Path) -> tuple[Path, str]:
+    """Returns (experiment relative path, chunk index) for a gene tree file, e.g.
+    'popsize_decrease_10x-N109-500Kb-1.gtrees' -> (Path('10X/down/N109'), '1')."""
+    p = Path(path)
+    stem = canonical_gtrees_stem(p)
+    return get_experiment_relative_path(p.parent / stem), get_chunk_index(stem)
 
 
 def resolve_fasta_file(f: Path, output_dir: Path) -> Path:
@@ -653,6 +696,36 @@ def expand_pattern_to_target_files(
     return target_files, suffix_label, prop_val
 
 
+def concat_output_stem(
+    alt_path: Path | None,
+    exp_folder_name: str,
+    np_pattern: str,
+    ap_pattern: str,
+    interval: str | None,
+    pct_intervals: list[tuple[float, float]] | None,
+) -> str:
+    """
+    The concat file stem (no extension) shared by concatenate_pair() (.fa) and
+    concatenate_gtrees_pair() (.gtrees), so both always name the same interval the same way.
+    pct_intervals is only used for custom np/ap patterns.
+    """
+    if interval:
+        is_custom_np = np_pattern.lower() != "n1n2n3n4n5n6n7n8n9n10n11n12"
+        is_custom_ap = ap_pattern.lower() != "a1a2a3"
+        interval_str_label = interval_label(interval)
+        if is_custom_np or is_custom_ap:
+            pattern_stem = build_interleaved_pattern_string(np_pattern, ap_pattern, pct_intervals)
+            return f"{pattern_stem};{interval_str_label}" if interval_str_label else pattern_stem
+        return interval_str_label if interval_str_label else exp_folder_name
+
+    is_pure_null = (not alt_path or str(alt_path).lower() == "null")
+    np_str = "" if np_pattern == "n1n2n3n4n5n6n7n8n9n10n11n12" else np_pattern
+    ap_str = "" if ap_pattern == "a1a2a3" else ap_pattern
+    parts = [np_str] if is_pure_null else [np_str, ap_str]
+    parts = [p for p in parts if p]
+    return "_".join(parts) if parts else exp_folder_name
+
+
 def concatenate_pair(
     null_path: Path | None,
     alt_path: Path | None,
@@ -675,24 +748,8 @@ def concatenate_pair(
     concat_dir = exp_dir / "concat"
 
     def _compute_output_path(pct_intervals):
-        if intervals:
-            is_custom_np = np_pattern.lower() != "n1n2n3n4n5n6n7n8n9n10n11n12"
-            is_custom_ap = ap_pattern.lower() != "a1a2a3"
-            interval_str_label = interval_label(interval)
-            if is_custom_np or is_custom_ap:
-                pattern_stem = build_interleaved_pattern_string(np_pattern, ap_pattern, pct_intervals)
-                output_stem = f"{pattern_stem};{interval_str_label}" if interval_str_label else pattern_stem
-            else:
-                output_stem = interval_str_label if interval_str_label else exp_folder_name
-            return concat_dir / f"{output_stem}.fa"
-        else:
-            is_pure_null = (not alt_path or str(alt_path).lower() == "null")
-            np_str = "" if np_pattern == "n1n2n3n4n5n6n7n8n9n10n11n12" else np_pattern
-            ap_str = "" if ap_pattern == "a1a2a3" else ap_pattern
-            parts = [np_str] if is_pure_null else [np_str, ap_str]
-            parts = [p for p in parts if p]
-            output_name = f"{'_'.join(parts)}.fa" if parts else f"{exp_folder_name}.fa"
-            return concat_dir / output_name
+        stem = concat_output_stem(alt_path, exp_folder_name, np_pattern, ap_pattern, interval, pct_intervals)
+        return concat_dir / f"{stem}.fa"
 
     # The output filename only depends on sequence content when an interval is given in raw
     # base-pair form (>100) - every other case (including everything simulate.py's default sweep
@@ -841,6 +898,187 @@ def concatenate_pair(
                 f.write(f"{''.join(base_seq[:len(null_seq)])}\n")
     print(f"Writing base FASTA: {output_path}", file=sys.stderr)
     print("Done.", file=sys.stderr)
+    return output_path
+
+
+GTREES_CHUNK_BP = 500_000
+
+
+# Standard 37 Palaeognathae and Galloanserae outgroup taxa
+OUTGROUP_TAXA = {
+    # Palaeognathae
+    "Struthio_camelus", "Rhea_americana", "Rhea_pennata", "Casuarius_casuarius",
+    "Dromaius_novaehollandiae", "Apteryx_haastii", "Apteryx_owenii", "Apteryx_australis",
+    "Apteryx_rowi", "Eudromia_elegans", "Nothoprocta_perdicaria", "Nothoprocta_ornata",
+    "Nothoprocta_pentlandii", "Nothocercus_julius", "Nothocercus_nigrocapillus",
+    "Tinamus_guttatus", "Crypturellus_soui", "Crypturellus_cinnamomeus", "Crypturellus_undulatus",
+    # Galloanserae
+    "Chauna_torquata", "Anseranas_semipalmata", "Anser_cygnoid", "Cairina_moschata",
+    "Asarcornis_scutulata", "Anas_platyrhynchos", "Anas_zonorhyncha", "Alectura_lathami",
+    "Penelope_pileata", "Numida_meleagris", "Odontophorus_gujanensis", "Colinus_virginianus",
+    "Callipepla_squamata", "Gallus_gallus", "Coturnix_japonica", "Phasianus_colchicus",
+    "Meleagris_gallopavo", "Tympanuchus_cupido",
+}
+
+
+def prune_outgroups(newick: str) -> str:
+    """
+    Removes OUTGROUP_TAXA leaves from one Newick tree so every gene tree has the same Neoaves
+    taxon set as the Neoaves-filtered FASTAs. Trees without outgroups are returned unchanged.
+    """
+    if not any(taxon in newick for taxon in OUTGROUP_TAXA):
+        return newick
+
+    import warnings
+    import treeswift
+
+    tree = treeswift.read_tree_newick(newick)
+    outgroups = {nd.label for nd in tree.traverse_leaves()} & OUTGROUP_TAXA
+    with warnings.catch_warnings():
+        # Removing the outgroups leaves unifurcations whose support labels treeswift warns about.
+        warnings.simplefilter("ignore")
+        pruned = tree.extract_tree_without(outgroups)
+        pruned.suppress_unifurcations()
+    pruned.root.edge_length = None
+    pruned.root.label = None
+    return pruned.newick().removeprefix("[&R] ")
+
+
+def read_gtrees(filepath: Path) -> list[str]:
+    """Reads a gene tree file: one Newick tree per non-empty line, in genome order."""
+    trees = []
+    with open(filepath, "r") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            if not line.endswith(";"):
+                sys.exit(f"Error: Line {line_no} of {filepath} is not a complete Newick tree (no trailing ';').")
+            trees.append(line)
+    if not trees:
+        sys.exit(f"Error: Gene tree file is empty: {filepath}")
+    return trees
+
+
+def _read_gtrees_chunks(chunk_dir: Path, indices: list[int], label: str) -> list[str]:
+    """Reads <chunk_dir>/<idx>.gtrees for every idx in order (outgroups pruned), erroring if any is missing."""
+    missing = [chunk_dir / f"{idx}{GTREES_EXT}" for idx in indices if not (chunk_dir / f"{idx}{GTREES_EXT}").is_file()]
+    if missing:
+        sys.exit(f"Error: {label} gene tree chunk file(s) missing: {', '.join(str(p) for p in missing)}")
+    trees = []
+    for idx in indices:
+        trees.extend(prune_outgroups(t) for t in read_gtrees(chunk_dir / f"{idx}{GTREES_EXT}"))
+    return trees
+
+
+def concatenate_gtrees_pair(
+    null_path: Path | None,
+    alt_path: Path | None,
+    output_dir: Path,
+    np_pattern: str = "n1n2n3n4n5n6n7n8n9n10n11n12",
+    ap_pattern: str = "a1a2a3",
+    proportion: str | float | None = None,
+    interval: str | None = None,
+) -> Path:
+    """
+    Gene tree counterpart of concatenate_pair(). Builds output_dir/<exp_rel>/concat/<stem>.gtrees
+    from null/gtrees/<n>.gtrees (np order) with <exp_rel>/gtrees/<a>.gtrees (ap order) inserted,
+    using the same insert-and-shift rule and the same output stem as the MSA concat, so tree i of
+    concat/<stem>.gtrees lines up with window i of concat/<stem>.fa:
+      out = null[0:st] + alt[0:len] + null[st:N - len]   (N = total null trees)
+    Percent intervals use int(start/100*N) and int((end-start)/100*N); base-pair intervals (>100)
+    assume each chunk is GTREES_CHUNK_BP long. With no alt (null-only), the null trees are also
+    the alt source, like concatenate_pair. `proportion` is accepted for parity and, like in
+    concatenate_pair, does not change the output. Skips if the target already exists.
+    """
+    if null_path and str(null_path).lower() != "null":
+        sys.exit(f"Error: Gene tree concat only supports the chunked null base ('null'), got '{null_path}'.")
+
+    intervals = parse_interval_pattern(interval) if interval else None
+    is_pure_null = (not alt_path or str(alt_path).lower() == "null")
+
+    exp_source = Path("null") if is_pure_null else Path(alt_path)
+    # Classify an experiment dir by its path under output_dir only, so ancestor dir names above
+    # output_dir can never leak into parse_filename()'s branch guess.
+    if exp_source.is_absolute() and exp_source.is_relative_to(output_dir):
+        exp_source = exp_source.relative_to(output_dir)
+    if exp_source.name.lower().endswith(GTREES_EXT):
+        exp_source = exp_source.parent / canonical_gtrees_stem(exp_source)
+    exp_rel_path = get_experiment_relative_path(exp_source)
+    concat_dir = output_dir / exp_rel_path / "concat"
+
+    null_matches = re.findall(r'[an](\d+)', np_pattern.lower())
+    null_chunk_indices = [int(m) for m in null_matches] if null_matches else list(range(1, 13))
+    total_bp = GTREES_CHUNK_BP * len(null_chunk_indices)
+
+    pct_intervals = None
+    if intervals:
+        pct_intervals = [
+            (float(s), float(e)) if e <= 100 else (s / float(total_bp) * 100.0, e / float(total_bp) * 100.0)
+            for s, e in intervals
+        ]
+    stem = concat_output_stem(None if is_pure_null else alt_path, exp_rel_path.name, np_pattern, ap_pattern, interval, pct_intervals)
+    output_path = concat_dir / f"{stem}{GTREES_EXT}"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[Concat Gene Trees] Concatenated gene trees already exist: {output_path}", file=sys.stderr)
+        return output_path
+
+    null_trees = _read_gtrees_chunks(output_dir / "null" / "gtrees", null_chunk_indices, "Null")
+    num_trees = len(null_trees)
+
+    alt_trees = null_trees
+    if not is_pure_null:
+        alt_matches = re.findall(r'[an](\d+)', ap_pattern.lower())
+        alt_chunk_indices = [int(m) for m in alt_matches] if alt_matches else [1, 2, 3]
+        alt_trees = _read_gtrees_chunks(output_dir / exp_rel_path / "gtrees", alt_chunk_indices, f"Alt ({exp_rel_path})")
+
+    if intervals:
+        parsed_intervals = []
+        for start_val, end_val in intervals:
+            if end_val <= 100:
+                st = int((start_val / 100.0) * num_trees)
+                length = int(((end_val - start_val) / 100.0) * num_trees)
+            else:
+                st = int(start_val / float(total_bp) * num_trees)
+                length = int((end_val - start_val) / float(total_bp) * num_trees)
+            parsed_intervals.append((st, length))
+
+        total_alt = sum(length for _, length in parsed_intervals)
+        if len(alt_trees) < total_alt:
+            sys.exit(f"Error: Interval '{interval}' needs {total_alt} alt gene trees but only {len(alt_trees)} exist for '{exp_rel_path}' (chunks {ap_pattern}).")
+        alt_sub = alt_trees[:total_alt]
+        trimmed_null_length = max(0, num_trees - total_alt)
+
+        final_trees = []
+        null_idx = 0
+        alt_idx = 0
+        curr_pos = 0
+        for st, length in sorted(parsed_intervals, key=lambda x: x[0]):
+            null_len = st - curr_pos
+            if null_len > 0:
+                final_trees.extend(null_trees[null_idx:null_idx + null_len])
+                null_idx += null_len
+                curr_pos += null_len
+            final_trees.extend(alt_sub[alt_idx:alt_idx + length])
+            alt_idx += length
+            curr_pos += length
+
+        remaining_null_len = trimmed_null_length - null_idx
+        if remaining_null_len > 0:
+            final_trees.extend(null_trees[null_idx:null_idx + remaining_null_len])
+    elif is_pure_null:
+        final_trees = null_trees
+    else:
+        # Default insertion (no interval): prefix the alt trees, like concatenate_pair.
+        final_trees = (alt_trees + null_trees[:max(0, num_trees - len(alt_trees))])[:num_trees]
+
+    concat_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    with open(tmp_path, "w") as f:
+        for tree in final_trees:
+            f.write(f"{tree}\n")
+    tmp_path.replace(output_path)
+    print(f"[Concat Gene Trees] Wrote {len(final_trees)} gene trees: {output_path}", file=sys.stderr)
     return output_path
 
 

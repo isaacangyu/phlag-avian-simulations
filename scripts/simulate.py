@@ -35,22 +35,11 @@ from concat_sequences import (
     get_chunk_index,
     concatenate_pair,
     get_missing_alt_chunk_warnings,
+    parse_proportion,
+    concatenate_gtrees_pair,
+    OUTGROUP_TAXA,
 )
-# Standard 37 Palaeognathae and Galloanserae outgroup taxa
-OUTGROUP_TAXA = {
-    # Palaeognathae
-    "Struthio_camelus", "Rhea_americana", "Rhea_pennata", "Casuarius_casuarius",
-    "Dromaius_novaehollandiae", "Apteryx_haastii", "Apteryx_owenii", "Apteryx_australis",
-    "Apteryx_rowi", "Eudromia_elegans", "Nothoprocta_perdicaria", "Nothoprocta_ornata",
-    "Nothoprocta_pentlandii", "Nothocercus_julius", "Nothocercus_nigrocapillus",
-    "Tinamus_guttatus", "Crypturellus_soui", "Crypturellus_cinnamomeus", "Crypturellus_undulatus",
-    # Galloanserae
-    "Chauna_torquata", "Anseranas_semipalmata", "Anser_cygnoid", "Cairina_moschata",
-    "Asarcornis_scutulata", "Anas_platyrhynchos", "Anas_zonorhyncha", "Alectura_lathami",
-    "Penelope_pileata", "Numida_meleagris", "Odontophorus_gujanensis", "Colinus_virginianus",
-    "Callipepla_squamata", "Gallus_gallus", "Coturnix_japonica", "Phasianus_colchicus",
-    "Meleagris_gallopavo", "Tympanuchus_cupido",
-}
+from estimate_gene_trees import ensure_estimated_gene_trees, DEFAULT_SEED
 
 
 def read_fasta(filepath: Path) -> dict[str, str]:
@@ -643,10 +632,52 @@ def _rename_ts_dir(ts_dir: Path) -> list[Path]:
     return ts_files
 
 
+_GTREES_WARNINGS: list[str] = []
+
+
+def ensure_gtrees_concat(null_path: Path, alt_path: Path | None, output_dir: Path, **concat_kwargs) -> Path | None:
+    """
+    Builds the pre-made gene tree concat (concat/<name>.gtrees) matching a sequence concat, when
+    null/gtrees/ and (for an alt experiment) <exp>/gtrees/ exist. Missing chunks or too few alt
+    trees are recorded as run-summary warnings instead of stopping the pipeline.
+    """
+    if not (output_dir / "null" / "gtrees").is_dir():
+        return None
+    if alt_path is not None and not (Path(alt_path) / "gtrees").is_dir():
+        return None
+    try:
+        return concatenate_gtrees_pair(null_path, alt_path, output_dir, **concat_kwargs)
+    except SystemExit as e:
+        # The same missing-chunk error repeats for every interval of an experiment - report it once.
+        exp_label = Path(alt_path).relative_to(output_dir) if alt_path is not None else "null"
+        warning = f"Gene tree concat skipped for {exp_label}: {e}"
+        if warning not in _GTREES_WARNINGS:
+            print(f"[Simulate] Warning: {warning}", file=sys.stderr)
+            _GTREES_WARNINGS.append(warning)
+        return None
+
+
+def _concat(null_path: Path, alt_path: Path | None, output_dir: Path, **concat_kwargs) -> Path:
+    """concatenate_pair() plus its matching pre-made gene tree concat. Returns the FASTA path."""
+    fa_path = concatenate_pair(null_path, alt_path, output_dir, **concat_kwargs)
+    ensure_gtrees_concat(null_path, alt_path, output_dir, **concat_kwargs)
+    return fa_path
+
+
+def _gtrees_only_sweep(output_dir: Path, exp_rels: set[Path], proportions: list[float]) -> None:
+    """Default six-proportion .gtrees concat sweep for experiments that only received new .gtrees
+    files this run (no new .ts files, so the sequence pipeline didn't visit them)."""
+    for exp_rel in sorted(exp_rels):
+        alt_path = None if exp_rel == Path("null") else output_dir / exp_rel
+        print(f"\n[Simulate -r] Running default gene tree concat sweep for {exp_rel}...", file=sys.stderr)
+        for p in proportions:
+            ensure_gtrees_concat(Path("null"), alt_path, output_dir, interval=proportion_to_centered_interval(p))
+
+
 def _print_run_summary() -> None:
     """Prints every alt-chunk-unavailable warning recorded during this run, or a success message
     if there were none (i.e. every requested chunk was found and simulated)."""
-    warnings = get_missing_alt_chunk_warnings()
+    warnings = get_missing_alt_chunk_warnings() + _GTREES_WARNINGS
     if warnings:
         print(f"\n[Simulate] {len(warnings)} alt chunk warning(s) during this run:")
         for w in warnings:
@@ -655,7 +686,7 @@ def _print_run_summary() -> None:
         print(f"\n[Simulate] Success: all requested chunks were fully simulated.")
 
 
-def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mutation_rate: float) -> list[Path]:
+def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mutation_rate: float, proportions: list[float]) -> list[Path]:
     """
     Shared by run_all() and run_ensure_all(): derives exp_dir's branch/node label strictly from
     its directory name, ensures its mapping, simulates+filters every given ts file, then runs the
@@ -672,24 +703,27 @@ def _finish_experiment(output_dir: Path, exp_dir: Path, ts_files: list[Path], mu
         ensure_neoaves_filtered(sim_fa, freshly_simulated)
 
     return [
-        concatenate_pair(Path("null"), exp_dir, output_dir, interval=proportion_to_centered_interval(p))
-        for p in DEFAULT_CENTERED_PROPORTIONS
+        _concat(Path("null"), exp_dir, output_dir, interval=proportion_to_centered_interval(p))
+        for p in proportions
     ]
 
 
-def run_all(output_dir: Path, mutation_rate: float) -> None:
+def run_all(output_dir: Path, mutation_rate: float, proportions: list[float] = DEFAULT_CENTERED_PROPORTIONS) -> list[Path]:
     """
     -r/--run-all: organizes every loose .ts file into its experiment directory, simulates only
     those files to FASTA (always Neoaves-filtered), ensures each experiment's mapping, then runs
     the default six-proportion concat sweep for each experiment. Single fixed behavior - the
     caller (main()) rejects any pattern/interval override before this is called.
     """
-    from organize_simulations import organize_loose_ts_files
+    from organize_simulations import organize_loose_ts_files, organize_loose_gtrees_files
     all_ts_files = organize_loose_ts_files(output_dir)
+    gtrees_exp_rels = {p.parent.parent.relative_to(output_dir) for p in organize_loose_gtrees_files(output_dir)}
 
     if not all_ts_files:
         print(f"No loose tree sequence (.ts) files found under '{output_dir}'.", file=sys.stderr)
-        return
+        _gtrees_only_sweep(output_dir, gtrees_exp_rels, proportions)
+        _print_run_summary()
+        return []
 
     print(f"[Simulate -r] Found {len(all_ts_files)} loose tree sequence file(s) under '{output_dir}'. Processing...", file=sys.stderr)
 
@@ -711,21 +745,24 @@ def run_all(output_dir: Path, mutation_rate: float) -> None:
                 sim_fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
                 ensure_neoaves_filtered(sim_fa, freshly_simulated)
             print(f"\n[Simulate -r] Running default concat sweep for null...", file=sys.stderr)
-            for proportion in DEFAULT_CENTERED_PROPORTIONS:
+            for proportion in proportions:
                 interval = proportion_to_centered_interval(proportion)
-                concat_files_created.append(concatenate_pair(Path("null"), None, output_dir, interval=interval))
+                concat_files_created.append(_concat(Path("null"), None, output_dir, interval=interval))
         else:
             print(f"\n[Simulate -r] Running default concat sweep for {exp_rel}...", file=sys.stderr)
-            concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate))
+            concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate, proportions))
+
+    _gtrees_only_sweep(output_dir, gtrees_exp_rels - set(exp_to_ts), proportions)
 
     print(f"\n[Simulate -r] All simulations completed successfully.", file=sys.stderr)
     print(f"\n[Simulate -r] Concat files created ({len(concat_files_created)}):")
     for cf in concat_files_created:
         print(f"  {cf}")
     _print_run_summary()
+    return concat_files_created
 
 
-def run_ensure_all(output_dir: Path, mutation_rate: float) -> None:
+def run_ensure_all(output_dir: Path, mutation_rate: float, proportions: list[float] = DEFAULT_CENTERED_PROPORTIONS) -> list[Path]:
     """
     No-target mode: for every already-organized node experiment directory
     (10X/{up,down}/*, recombination/{up,down}/*, admixture/{low,high}/*) - null is skipped, and
@@ -749,13 +786,14 @@ def run_ensure_all(output_dir: Path, mutation_rate: float) -> None:
         rel_dir = exp_dir.relative_to(output_dir)
         print(f"\n[Simulate] Ensuring experiment complete: {rel_dir}", file=sys.stderr)
         ts_files = _rename_ts_dir(exp_dir / "ts")
-        concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate))
+        concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate, proportions))
 
     print(f"\n[Simulate] {len(exp_dirs)} experiment director{'y' if len(exp_dirs) == 1 else 'ies'} ensured complete.")
     print(f"[Simulate] Concat files created ({len(concat_files_created)}):")
     for cf in concat_files_created:
         print(f"  {cf}")
     _print_run_summary()
+    return concat_files_created
 
 
 def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
@@ -769,10 +807,10 @@ def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, int
         ensure_neoaves_filtered(fa, freshly_simulated)
 
     if interval:
-        return [concatenate_pair(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
+        return [_concat(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
 
     return [
-        concatenate_pair(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
+        _concat(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
         for p in DEFAULT_CENTERED_PROPORTIONS
     ]
 
@@ -820,10 +858,10 @@ def run_relative_dir(output_dir: Path, rel_dir: Path, np_pattern: str, ap_patter
         ensure_neoaves_filtered(fa, freshly_simulated)
 
     if interval:
-        return [concatenate_pair(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
+        return [_concat(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
 
     return [
-        concatenate_pair(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
+        _concat(Path("null"), exp_dir, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
         for p in DEFAULT_CENTERED_PROPORTIONS
     ]
 
@@ -862,7 +900,7 @@ def main(argv=None):
         dest="proportion",
         type=str,
         default=None,
-        help="Proportion of alternative sequence (e.g. 0.25, 0.5, 3/12)."
+        help="Proportion of alternative sequence (e.g. 0.1, 0.25, 3/12). On its own it replaces the default six-proportion sweep with that proportion's centered interval (0.1 -> 45-55). Works with every mode."
     )
     parser.add_argument(
         "--np", "--null-pattern", type=str, default="n1n2n3n4n5n6n7n8n9n10n11n12", help="Null pattern string specifying null chunk order."
@@ -882,37 +920,68 @@ def main(argv=None):
         dest="run_all",
         help="Organize every loose tree sequence file and simulate/map/concat each experiment (including null) with the default centered-proportion sweep. Accepts no target, interval, or --np/--ap/-p overrides."
     )
+    parser.add_argument(
+        "-g", "--gene-trees",
+        action="store_true",
+        help="Last step: estimate gene trees (IQ-TREE 2, GTR+G, --fast) from 500bp windows every 8.5kb of the simulated null and alt chunks, then insert the alt trees for each concat interval of this run: <exp_dir>/genetrees/<interval>.gtrees. Works with every mode."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Seed for the random window start offsets used by --gene-trees."
+    )
+    parser.add_argument(
+        "--gt-threads",
+        type=int,
+        default=None,
+        help="Max parallel IQ-TREE jobs for --gene-trees (default: all CPUs)."
+    )
     args = parser.parse_args(argv)
 
     output_dir = get_output_dir()
 
+    # -p on its own means the centered interval for that proportion (e.g. 0.1 -> 45-55) instead
+    # of the default six-proportion sweep.
+    proportions = [parse_proportion(args.proportion)] if args.proportion else DEFAULT_CENTERED_PROPORTIONS
+    if args.proportion and not args.interval:
+        args.interval = proportion_to_centered_interval(proportions[0])
+
     has_overrides = bool(
-        args.interval or args.proportion
+        (args.interval and not args.proportion)
         or args.np != "n1n2n3n4n5n6n7n8n9n10n11n12"
         or args.ap != "a1a2a3"
     )
 
     if args.run_all:
         if args.target is not None or has_overrides:
-            sys.exit("Error: -r/--run-all does not accept a target, interval, or --np/--ap/-p overrides - it always organizes and simulates every experiment with the default sweep.")
-        run_all(output_dir, args.mutation_rate)
-        return
-
-    if args.target is None:
+            sys.exit("Error: -r/--run-all does not accept a target, interval, or --np/--ap overrides - it organizes and simulates every experiment with the default sweep, or only -p's centered interval if given.")
+        concat_files = run_all(output_dir, args.mutation_rate, proportions)
+    elif args.target is None:
         if has_overrides:
-            sys.exit("Error: No target given. Pass 'null' or a relative experiment directory to use --np/--ap/-p/interval; omit all arguments to ensure every node experiment directory is complete.")
-        run_ensure_all(output_dir, args.mutation_rate)
-        return
-
-    if args.target == "null":
-        concat_files = run_null(output_dir, args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
+            sys.exit("Error: No target given. Pass 'null' or a relative experiment directory to use --np/--ap/interval; omit them to ensure every node experiment directory is complete (-p is allowed).")
+        concat_files = run_ensure_all(output_dir, args.mutation_rate, proportions)
     else:
-        concat_files = run_relative_dir(output_dir, Path(args.target), args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
+        if args.target == "null":
+            concat_files = run_null(output_dir, args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
+        else:
+            concat_files = run_relative_dir(output_dir, Path(args.target), args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
 
-    print(f"\n[Simulate] Concat files created ({len(concat_files)}):")
-    for cf in concat_files:
-        print(f"  {cf}")
-    _print_run_summary()
+        print(f"\n[Simulate] Concat files created ({len(concat_files)}):")
+        for cf in concat_files:
+            print(f"  {cf}")
+        _print_run_summary()
+
+    if args.gene_trees:
+        # Gene trees always use the default null/alt chunk order; only each concat file's
+        # interval (the part of its name after any ';') carries over.
+        exp_to_intervals = {}
+        for cf in concat_files:
+            exp_to_intervals.setdefault(cf.parent.parent, []).append(cf.stem.split(";")[-1])
+        print(f"\n[Simulate] Estimating gene trees for {len(exp_to_intervals)} experiment(s)...", file=sys.stderr)
+        for exp_dir, intervals in exp_to_intervals.items():
+            is_null = exp_dir == output_dir / "null"
+            ensure_estimated_gene_trees(output_dir, None if is_null else exp_dir, None if is_null else intervals, args.gt_threads, args.seed)
 
 
 if __name__ == "__main__":
