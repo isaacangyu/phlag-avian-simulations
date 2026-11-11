@@ -14,7 +14,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from concat_sequences import get_experiment_folder_name, get_experiment_relative_path, get_chunk_index, classify_gtrees_file, GTREES_EXT
+from concat_sequences import get_experiment_folder_name, get_experiment_relative_path, get_chunk_index, classify_gtrees_file, is_joined_gtrees_file, GTREES_EXT
 from simulate import generate_new_filename
 
 def organize_loose_ts_files(sim_dir: Path) -> list[Path]:
@@ -57,17 +57,22 @@ def organize_loose_ts_files(sim_dir: Path) -> list[Path]:
 def organize_loose_gtrees_files(sim_dir: Path) -> list[Path]:
     """
     Moves every loose .gtrees file under sim_dir (top level included; not already inside a
-    gtrees/ dir, and not a concat/ output) to <exp>/gtrees/<chunk_idx>.gtrees. Refuses to
+    gtrees/ dir, and not a concat/ or genetrees/ output) to <exp>/gtrees/<chunk_idx>.gtrees. Refuses to
     overwrite a different existing file; an identical one is left in place and reported.
-    Returns the organized paths.
+    Returns only the newly moved paths, so experiments whose gene trees already exist aren't
+    re-concatenated.
     """
     if not sim_dir.exists():
         return []
 
     loose_files = sorted(
         p for p in sim_dir.rglob(f"*{GTREES_EXT}")
-        if p.is_file() and p.parent.name not in ("gtrees", "concat")
+        if p.is_file() and p.parent.name not in ("gtrees", "concat", "genetrees")
     )
+    joined = [p for p in loose_files if is_joined_gtrees_file(p)]
+    if joined:
+        print(f"[Organize] Skipping {len(joined)} pre-joined gene tree file(s) (*-concat-*{GTREES_EXT}), left in place", file=sys.stderr)
+        loose_files = [p for p in loose_files if p not in joined]
     if not loose_files:
         return []
 
@@ -93,10 +98,10 @@ def organize_loose_gtrees_files(sim_dir: Path) -> list[Path]:
     for p, final_path, exp_rel in moves:
         if final_path.exists():
             print(f"[Organize] Identical file already at {exp_rel}/gtrees/{final_path.name}, leaving loose copy {p.relative_to(sim_dir)} in place", file=sys.stderr)
-        else:
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            print(f"[Organize] Moving {p.relative_to(sim_dir)} -> {exp_rel}/gtrees/{final_path.name}", file=sys.stderr)
-            p.rename(final_path)
+            continue
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[Organize] Moving {p.relative_to(sim_dir)} -> {exp_rel}/gtrees/{final_path.name}", file=sys.stderr)
+        p.rename(final_path)
         organized_paths.append(final_path)
 
     return organized_paths

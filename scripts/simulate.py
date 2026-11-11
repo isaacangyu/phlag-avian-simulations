@@ -8,7 +8,8 @@ Simulate command pipeline. Four modes, selected by exactly one positional target
                     node directory - use -r for those.
   -r/--run-all      Organizes every loose tree sequence file, simulates/maps/concats each
                     experiment with the default six-proportion sweep. No other arguments.
-  null              Simulates/filters/concats the null experiment only.
+  null              Simulates/filters the null chunks only. No null-only concat is written: the
+                    null chunks are joined (in a random order per file) only inside alt concats.
   <relative_dir>    Simulates/maps/concats an already-existing experiment directory (relative
                     to the simulations dir) against null, applying --np/--ap/-p/interval if given.
 """
@@ -721,7 +722,7 @@ def run_all(output_dir: Path, mutation_rate: float, proportions: list[float] = D
 
     if not all_ts_files:
         print(f"No loose tree sequence (.ts) files found under '{output_dir}'.", file=sys.stderr)
-        _gtrees_only_sweep(output_dir, gtrees_exp_rels, proportions)
+        _gtrees_only_sweep(output_dir, gtrees_exp_rels - {Path("null")}, proportions)
         _print_run_summary()
         return []
 
@@ -744,15 +745,11 @@ def run_all(output_dir: Path, mutation_rate: float, proportions: list[float] = D
             for ts_path in ts_files:
                 sim_fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
                 ensure_neoaves_filtered(sim_fa, freshly_simulated)
-            print(f"\n[Simulate -r] Running default concat sweep for null...", file=sys.stderr)
-            for proportion in proportions:
-                interval = proportion_to_centered_interval(proportion)
-                concat_files_created.append(_concat(Path("null"), None, output_dir, interval=interval))
         else:
             print(f"\n[Simulate -r] Running default concat sweep for {exp_rel}...", file=sys.stderr)
             concat_files_created.extend(_finish_experiment(output_dir, exp_dir, ts_files, mutation_rate, proportions))
 
-    _gtrees_only_sweep(output_dir, gtrees_exp_rels - set(exp_to_ts), proportions)
+    _gtrees_only_sweep(output_dir, gtrees_exp_rels - set(exp_to_ts) - {Path("null")}, proportions)
 
     print(f"\n[Simulate -r] All simulations completed successfully.", file=sys.stderr)
     print(f"\n[Simulate -r] Concat files created ({len(concat_files_created)}):")
@@ -796,23 +793,16 @@ def run_ensure_all(output_dir: Path, mutation_rate: float, proportions: list[flo
     return concat_files_created
 
 
-def run_null(output_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
-    """The literal 'null' target: simulates/filters the needed null chunks, then concatenates -
-    an explicit interval if given, else the default six-proportion sweep."""
+def run_null(output_dir: Path, np_pattern: str, mutation_rate: float) -> list[Path]:
+    """The literal 'null' target: simulates/filters the needed null chunks. No null-only concat is
+    written - null chunks are only joined at runtime inside alt concats."""
     matches = re.findall(r'[an](\d+)', np_pattern.lower())
     null_chunk_indices = [int(m) for m in matches] if matches else list(range(1, 13))
     for idx in null_chunk_indices:
         ts_path = output_dir / "null" / "ts" / f"{idx}.ts"
         fa, freshly_simulated = ensure_sequence_simulated(ts_path, output_dir, mutation_rate=mutation_rate)
         ensure_neoaves_filtered(fa, freshly_simulated)
-
-    if interval:
-        return [_concat(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, proportion=proportion, interval=interval)]
-
-    return [
-        _concat(Path("null"), None, output_dir, np_pattern=np_pattern, ap_pattern=ap_pattern, interval=proportion_to_centered_interval(p))
-        for p in DEFAULT_CENTERED_PROPORTIONS
-    ]
+    return []
 
 
 def run_relative_dir(output_dir: Path, rel_dir: Path, np_pattern: str, ap_pattern: str, proportion, interval, mutation_rate: float) -> list[Path]:
@@ -963,7 +953,9 @@ def main(argv=None):
         concat_files = run_ensure_all(output_dir, args.mutation_rate, proportions)
     else:
         if args.target == "null":
-            concat_files = run_null(output_dir, args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
+            if args.interval or args.ap != "a1a2a3":
+                sys.exit("Error: 'null' only simulates the null chunks (no null-only concat is written), so it takes no interval, -p, or --ap.")
+            concat_files = run_null(output_dir, args.np, args.mutation_rate)
         else:
             concat_files = run_relative_dir(output_dir, Path(args.target), args.np, args.ap, args.proportion, args.interval, args.mutation_rate)
 
@@ -978,6 +970,8 @@ def main(argv=None):
         exp_to_intervals = {}
         for cf in concat_files:
             exp_to_intervals.setdefault(cf.parent.parent, []).append(cf.stem.split(";")[-1])
+        if args.target == "null":
+            exp_to_intervals[output_dir / "null"] = []
         print(f"\n[Simulate] Estimating gene trees for {len(exp_to_intervals)} experiment(s)...", file=sys.stderr)
         for exp_dir, intervals in exp_to_intervals.items():
             is_null = exp_dir == output_dir / "null"

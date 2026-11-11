@@ -40,7 +40,7 @@ simulations/
 
 - `ts/` — raw tree sequence files (`<chunk_idx>.ts`, chunks 1-12)
 - `simulated/` — sequences simulated to FASTA (`<chunk_idx>.fa`), Neoaves-filtered for null/node chunks
-- `concat/` — final concatenated 6Mbp FASTA files (null + inserted alt proportion)
+- `concat/` — final concatenated 6Mbp FASTA files (null + inserted alt proportion). The 12 null chunks are joined in a random order picked per file (seeded from the experiment and interval, so a rebuild matches); the order is saved as `<name>.null_order`, and the matching `<name>.gtrees` uses the same order. Older files built with null chunks in increasing order end in `_inc` (e.g. `40-60_inc.fa`, `40-60_inc.gtrees`). No null-only concat is written.
 - `gtrees/` — pre-made gene tree chunks (`<chunk_idx>.gtrees`), organized by `-r` from loose `.gtrees` files
 - `genetrees/` — gene trees estimated with IQ-TREE (`-g` only): `null.gtrees` / `alt.gtrees`, plus `<interval>.gtrees` with the alt trees inserted
 
@@ -68,7 +68,7 @@ simulate
 # 2. -r/--run-all: organize loose .ts files into experiment dirs, then complete every experiment, including null.
 simulate -r
 
-# 3. 'null': simulate/filter/concat only the null experiment.
+# 3. 'null': simulate/filter only the null chunks (no null-only concat).
 simulate null
 
 # 4. <relative_dir>: simulate/map/concat one existing experiment directory against null.
@@ -84,7 +84,7 @@ Optional flags (modes 3 and 4 only):
 | Flag | Description |
 |---|---|
 | `interval` (2nd positional) | Explicit insertion interval, e.g. `40-60`. Omit for the default six-proportion centered sweep (`0.02, 0.05, 0.1, 0.15, 0.20, 0.25`). |
-| `--np`, `--null-pattern` | Null chunk order pattern (default `n1n2n3n4n5n6n7n8n9n10n11n12`). |
+| `--np`, `--null-pattern` | Null chunk order pattern. Default: a random order per concat file. Give any other pattern (e.g. `n2n1n3n4n5n6n7n8n9n10n11n12`) to fix the order. |
 | `--ap`, `--alt-pattern` | Alt chunk order pattern (default `a1a2a3`). |
 | `-mrate`, `--mutation-rate` | Mutation rate for sequence simulation (default `1.9086e-08`). |
 
